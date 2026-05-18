@@ -1,4 +1,4 @@
-"""
+﻿"""
 Dual flow solving pipeline: (G, G') network pair complete data generation
 
 Full procedure steps:
@@ -6,7 +6,7 @@ Full procedure steps:
   Step 2 — First SUE solving   : Run Frank-Wolfe on G → flows_old [N, E_old]
   Step 3 — Network pair creation: Call generate_network_pairs, passing flows_old to locate high-flow nodes
   Step 4 — Second SUE solving  : Run Frank-Wolfe on each G' → flows_new [E_new_i]
-  Step 5 — Save results        : Output .pkl file, for use by build_pyg_data.py
+  Step 5 — Save results        : Output .pkl file, for use by build_network_pairs_dataset.py
 
 Strict constraints:
   - G and G' share exactly the same OD matrix (OD is never used as a model node feature)
@@ -28,7 +28,8 @@ Output data structure (each completed_pair is a dict):
 
 Usage:
   python solve_network_pairs.py --num_samples 2000 --network_name SiouxFalls
-  python solve_network_pairs.py --num_samples 2000 --network_name EMA --demand_source lhs
+  python solve_network_pairs.py --num_samples 2000 --network_name Anaheim --demand_source trips
+  python solve_network_pairs.py --num_samples 2000 --network_name CustomNet --network_file path/to/net.tntp --od_file path/to/trips.tntp
   python solve_network_pairs.py --num_samples 2000 --skip_first_solve  # resume job from checkpoint
 """
 
@@ -42,7 +43,7 @@ from datetime import datetime
 import numpy as np
 from tqdm import tqdm
 
-# Compatible with both direct execution (python solve_network_pairs.py) and module import
+# Support both direct execution (python solve_network_pairs.py) and module import
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from generate_scenarios import (
@@ -330,12 +331,12 @@ def run_second_sue_solve(
     - Each G' may have different number/order of edges (due to topology mutations)
     - Must extract capacity and free_flow_time directly from G' graph attributes
     - flows_new[i] indexed by list(G_prime.edges()) (different from flows_old indexing!)
-    - edge_list_new[i] must be saved explicitly, build_pyg_data.py relies on it to recover edge_index_new
+    - edge_list_new[i] must be saved explicitly, build_network_pairs_dataset.py relies on it to recover edge_index_new
 
     Failure handling:
     - Catch all exceptions (NetworkXNoPath, NaN/Inf, convergence failure, etc)
     - Failed sample is logged in failed_indices and skipped, not added to completed_pairs
-    - Given strong connectivity in Sioux Falls, failure rate should be near 0%
+    - Given strong connectivity in the supported benchmark networks, failure rate should be near 0%
 
     Args:
         scenario_pairs:       output of generate_network_pairs, list of dict
@@ -393,7 +394,7 @@ def run_second_sue_solve(
                     )
 
             # --- Build complete data pair ---
-            # Explicitly save edge_list_old/new to eliminate edge order ambiguity in later build_pyg_data.py.
+            # Explicitly save edge_list_old/new to eliminate edge order ambiguity in later build_network_pairs_dataset.py.
             # Can't rely on re-calling list(G.edges()) to recover order, since after pickle deserialization 
             # the graph object's iteration order may theoretically differ from when saved (even though NetworkX is usually stable).
             edge_list_old = list(pair['G'].edges())
@@ -487,7 +488,7 @@ def run_pipeline(args) -> list:
     Full "generate → solve → reconstruct → solve" pipeline control function.
 
     Execution order:
-      Step 1 — Load Sioux Falls base topology
+      Step 1 — Load base topology
       Step 2 — LHS sample base scenarios (or load from file)
       Step 3 — First SUE batch solve (or load flows_old from file)
       Step 4 — Generate (G, G') network pairs (pass in flows_old to locate high-flow nodes)
@@ -723,7 +724,7 @@ def parse_args():
     )
     # Basic arguments
     parser.add_argument('--network_name', type=str, default='SiouxFalls',
-                        help='Built-in network preset: SiouxFalls, EMA, Anaheim')
+                        help='Network preset name or custom display name')
     parser.add_argument('--dataset_root', type=str, default='',
                         help='Root directory containing raw network / OD files')
     parser.add_argument('--network_file', type=str, default='',

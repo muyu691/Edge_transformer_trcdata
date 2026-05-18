@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Iterable, Optional, Tuple
-import os
 
 
 _MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -10,15 +10,7 @@ _MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 @dataclass(frozen=True)
 class MutationPolicy:
-    """Targeted joint-mutation policy used by the data generator.
-
-    Default strategy:
-      - every sample applies topology change + attribute change
-      - add edges from the top 30% highest-flow nodes
-      - delete one outgoing edge from the bottom 20% lowest-flow nodes
-      - mutate attributes on a random 20% subset of edges
-      - clip mutated capacity / speed back into the original feasible ranges
-    """
+    """Targeted joint-mutation policy used by the data generator."""
 
     high_flow_add_ratio: float = 0.30
     edges_per_node_range: Tuple[int, int] = (1, 3)
@@ -76,15 +68,14 @@ def _normalize_name(network_name: str) -> str:
 
 
 def parse_centroid_nodes(raw_value: Optional[Iterable[int] | str]) -> Optional[Tuple[int, ...]]:
-    """Parse explicit centroid node ids from CLI/config values."""
     if raw_value is None:
         return None
     if isinstance(raw_value, str):
         cleaned = raw_value.strip()
         if not cleaned:
             return None
-        return tuple(int(x.strip()) for x in cleaned.split(",") if x.strip())
-    return tuple(int(x) for x in raw_value)
+        return tuple(int(item.strip()) for item in cleaned.split(",") if item.strip())
+    return tuple(int(item) for item in raw_value)
 
 
 def _resolve_path(dataset_root: str, file_path: str) -> str:
@@ -106,6 +97,43 @@ def _resolve_dataset_root(dataset_root: str, relative_to_module: bool = False) -
     return os.path.abspath(os.path.join(base_dir, dataset_root))
 
 
+def _build_custom_spec(
+    network_name: str,
+    dataset_root: str,
+    network_file: str,
+    od_file: str,
+    parser: str,
+    node_id_offset: int,
+    demand_source: str,
+    centroid_nodes: Optional[Tuple[int, ...]],
+) -> NetworkSpec:
+    if not network_file:
+        raise ValueError(
+            f"Unknown network_name='{network_name}'. "
+            "Provide --network_file (and optionally --dataset_root / --od_file) "
+            "to use a custom network preset."
+        )
+
+    resolved_root = _resolve_dataset_root(dataset_root, relative_to_module=False)
+    resolved_network_file = _resolve_path(resolved_root, network_file)
+    resolved_od_file = _resolve_path(resolved_root, od_file)
+    display_name = (network_name or os.path.splitext(os.path.basename(network_file))[0]).strip()
+    if not display_name:
+        display_name = "CustomNetwork"
+
+    return NetworkSpec(
+        network_name=display_name,
+        dataset_root=resolved_root,
+        network_file=resolved_network_file,
+        od_file=resolved_od_file,
+        parser=parser,
+        node_id_offset=node_id_offset,
+        demand_source=demand_source,
+        centroid_nodes=centroid_nodes,
+        mutation_policy=MutationPolicy(),
+    )
+
+
 def resolve_network_spec(
     network_name: str = "SiouxFalls",
     dataset_root: str = "",
@@ -116,12 +144,19 @@ def resolve_network_spec(
     demand_source: str = "lhs",
     centroid_nodes: Optional[Iterable[int] | str] = None,
 ) -> NetworkSpec:
-    """Resolve a network spec from built-in defaults plus user overrides."""
     key = _normalize_name(network_name)
+    explicit_centroids = parse_centroid_nodes(centroid_nodes)
+
     if key not in _BUILTIN_SPECS:
-        raise ValueError(
-            f"Unsupported network_name='{network_name}'. "
-            f"Supported values: {sorted(_BUILTIN_SPECS)}"
+        return _build_custom_spec(
+            network_name=network_name,
+            dataset_root=dataset_root,
+            network_file=network_file,
+            od_file=od_file,
+            parser=parser,
+            node_id_offset=node_id_offset,
+            demand_source=demand_source,
+            centroid_nodes=explicit_centroids,
         )
 
     base = _BUILTIN_SPECS[key]
@@ -129,16 +164,9 @@ def resolve_network_spec(
         dataset_root or base["dataset_root"],
         relative_to_module=not bool(dataset_root),
     )
-    resolved_network_file = _resolve_path(
-        resolved_root,
-        network_file or base["network_file"],
-    )
-    resolved_od_file = _resolve_path(
-        resolved_root,
-        od_file or base["od_file"],
-    )
+    resolved_network_file = _resolve_path(resolved_root, network_file or base["network_file"])
+    resolved_od_file = _resolve_path(resolved_root, od_file or base["od_file"])
 
-    explicit_centroids = parse_centroid_nodes(centroid_nodes)
     if explicit_centroids is None:
         explicit_centroids = base["centroid_nodes"]
 

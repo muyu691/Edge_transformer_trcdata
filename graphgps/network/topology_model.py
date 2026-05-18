@@ -1,44 +1,9 @@
-"""
-Pseudo-Spatiotemporal Physics-Informed Diffusion Model (ST-PINN)
-================================================================
+"""ST-PINN diffusion backbone for traffic topology reconfiguration."""
 
-Core innovation: Simulate traffic flow redistribution as a physics-driven
-diffusion process over K pseudo-time steps, predicting new equilibrium flows
-after network topology reconfiguration.  Absolutely NO OD matrix is used.
-
-Architecture (self-driven physical simulator unrolled over K steps):
-
-  ┌─────────────────────────────────────────────────────────────────┐
-  │ Phase 2: Initial State Projection (k=0)                         │
-  │   _project_initial_flow  → f_scaled_0 : [E_new, 1]             │
-  │   _compute_initial_pressure → rho_v_0 : [N, 1]  (real space)   │
-  ├─────────────────────────────────────────────────────────────────┤
-  │ EdgeAlignmentModule → aligned_features : [E_new, 8]             │
-  │   (static edge context for h_e^(0) initialization)              │
-  ├─────────────────────────────────────────────────────────────────┤
-  │ Phase 3: Pseudo-Time Diffusion Loop  (k = 1 … K)               │
-  │   DiffusionCell (Neural Darcy's Law):                           │
-  │     Dual-stream: GatedGCN (local) + Self-Attention (global)     │
-  │     → Δf_scaled^(k)                                             │
-  │   Flow update:  f^(k) = f^(k-1) + Δf^(k)                       │
-  │   LWR update:   ρ^(k) = ρ^(k-1) + scatter(Δf_real, in - out)   │
-  ├─────────────────────────────────────────────────────────────────┤
-  │ Output: f_scaled^(K)  (terminal equilibrium flows, normalized)  │
-  │         ρ_v^(K)       (terminal pressure, should → 0)           │
-  └─────────────────────────────────────────────────────────────────┘
-
-Legacy modules (OldGraphEncoder, NewGraphReasoner) are retained for reference
-but are no longer used in the forward pass.
-
-Batch processing note:
-  PyG's Batch.from_data_list() adds node offsets via __inc__, so edge_index_old
-  and edge_index_new contain globally unique node IDs after batching.
-  Hash keys (src × total_nodes + dst) remain unique across graphs.
-"""
+from __future__ import annotations
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch_geometric.graphgym.config import cfg
 from torch_geometric.graphgym.register import register_network
 from torch_geometric.utils import to_dense_batch
@@ -47,574 +12,273 @@ from graphgps.layer.gatedgcn_layer import GatedGCNLayer
 from graphgps.utils import match_edge_indices
 
 
-# ============================================================
-# Lightweight GNN Batch container
-# ============================================================
-
 class _GNNBatch:
-    """
-    Minimalist data container—intended solely to drive GatedGCNLayer.forward().
+    """Minimal container used to drive GatedGCNLayer.forward()."""
 
-    GatedGCNLayer.forward(batch) only accesses these three fields:
-      batch.x          : [N, H]  node features
-      batch.edge_attr  : [E, H]  edge features
-      batch.edge_index : [2, E]  connectivity
+    __slots__ = ("x", "edge_attr", "edge_index")
 
-    When GatedGCNLayer is initialized with equivstable_pe=False,
-    code path `batch.pe_EquivStableLapPE` will never be executed
-    (Python short-circuit evaluation), so this container does not need it.
-    """
-
-    __slots__ = ('x', 'edge_attr', 'edge_index')
-
-    def __init__(
-        self,
-        x: torch.Tensor,
-        edge_attr: torch.Tensor,
-        edge_index: torch.Tensor,
-    ) -> None:
+    def __init__(self, x: torch.Tensor, edge_attr: torch.Tensor, edge_index: torch.Tensor) -> None:
         self.x = x
         self.edge_attr = edge_attr
         self.edge_index = edge_index
 
 
-# ============================================================
-# Module 1: OldGraphEncoder (historical hub memory encoder)
-# ============================================================
-
-class OldGraphEncoder(nn.Module):
-    """
-    Encodes historical traffic congestion patterns on the old graph G.
-
-    Design notes:
-      - Nodes are initialized as "blank slate" ones(N, H), starting directly in hidden space,
-        avoiding a meaningless 1 → H linear mapping.
-      - Edge inputs = cat([edge_attr_old(3), flow_old(1)]) = [E_old, 4],
-        then projected into hidden space and fed to the GatedGCN stack.
-      - The gated aggregation of GatedGCN allows the model to distinguish high/low flow links,
-        effectively learning "which nodes are congestion hubs."
-
-    Tensor shape conventions (H = hidden_dim):
-      Input:
-        edge_index_old  : [2, E_old]
-        edge_attr_old   : [E_old, 3]  - [capacity, speed, length] (normalized)
-        flow_old        : [E_old, 1]  - historical equilibrium flows (normalized)
-        num_nodes       : int         - batch total node count
-
-      Output:
-        h_nodes_old     : [num_nodes, H]  - node historical memory embedding
-    """
-
-    def __init__(
-        self,
-        hidden_dim: int,
-        num_layers: int,
-        dropout: float,
-        residual: bool,
-    ) -> None:
-        super().__init__()
-        self.hidden_dim = hidden_dim
-
-        # Edge feature projection: [capacity, speed, length, flow_old] → hidden space
-        # Shape change: [E_old, 4] → [E_old, H]
-        # GatedGCNLayer requires node and edge features to have the same dimension (H)
-        self.edge_proj = nn.Linear(4, hidden_dim)
-
-        # Stacked GatedGCN layers: multi-round message passing on old graph topology
-        # Each layer: in_dim = out_dim = H, keep dimensions invariant
-        self.gnn_layers = nn.ModuleList([
-            GatedGCNLayer(
-                in_dim=hidden_dim,
-                out_dim=hidden_dim,
-                dropout=dropout,
-                residual=residual,
-            )
-            for _ in range(num_layers)
-        ])
-
-    def forward(
-        self,
-        edge_index_old: torch.Tensor,   # [2, E_old]
-        edge_attr_old: torch.Tensor,    # [E_old, 3]
-        flow_old: torch.Tensor,         # [E_old, 1]
-        num_nodes: int,
-    ) -> torch.Tensor:                  # → [num_nodes, H]
-
-        device = edge_attr_old.device
-        dtype  = edge_attr_old.dtype
-
-        # -- Blank node initialization -------------------------------------
-        # Directly initialize in hidden space H, avoiding meaningless 1→H layer.
-        # All nodes start in the same "no prior" state; history is injected solely
-        # via message passing from edge flows.
-        # Shape: [num_nodes, H]
-        x = torch.ones(num_nodes, self.hidden_dim, device=device, dtype=dtype)
-
-        # -- Edge feature projection ---------------------------------------
-        # cat([edge_attr_old(3), flow_old(1)]) → [E_old, 4]
-        # then project to hidden space      → [E_old, H]
-        e_raw = torch.cat([edge_attr_old, flow_old], dim=-1)  # [E_old, 4]
-        e = self.edge_proj(e_raw)                              # [E_old, H]
-
-        # -- Stacked message passing (old graph topology) -----------------
-        for layer in self.gnn_layers:
-            mini_batch = _GNNBatch(x, e, edge_index_old)
-            mini_batch = layer(mini_batch)
-            x = mini_batch.x           # [num_nodes, H]
-            e = mini_batch.edge_attr   # [E_old, H]
-
-        # Return node embedding as "historical congestion memory", discard edge embeddings
-        return x   # h_nodes_old : [num_nodes, H]
-
-
-# ============================================================
-# Module 2: EdgeAlignmentModule (heterogeneous edge feature alignment)
-# ============================================================
-
 class EdgeAlignmentModule(nn.Module):
-    """
-    Vectorized heterogeneous edge feature alignment module (no learnable params).
+    """Align old/new edge features on the new graph edge set."""
 
-    Core algorithm: O(E_old + E_new) vectorized matching based on node-pair hash.
-
-    Alignment rules (strictly follow .cursorrules Phase 2 spec):
-    ┌──────────────────────────────────────────────────────────────┐
-    │ Retained edge (present in both G and G'):                   │
-    │   [edge_attr_old(3), flow_old(1), edge_attr_new(3), 0(1)]   │
-    │   → 8-dim total, is_new_edge = 0                            │
-    ├──────────────────────────────────────────────────────────────┤
-    │ Added/new edge (only in G'):                                │
-    │   [zeros(3),         zero(1),    edge_attr_new(3), 1(1)]    │
-    │   → 8-dim total, is_new_edge = 1                            │
-    └──────────────────────────────────────────────────────────────┘
-
-    Hash coding scheme:
-      key(src, dst) = src × total_nodes + dst
-      Since src, dst ∈ [0, total_nodes), key is unique for each node-pair.
-
-    Batch correctness:
-      PyG applies node offset to edge indices (__inc__) such that node IDs in different graphs
-      do not overlap. Thus, using total_nodes (batch-global node count) as hash base, keys are unique.
-
-    Tensor shape conventions (H = hidden_dim):
-      Input:
-        edge_index_old  : [2, E_old]
-        edge_attr_old   : [E_old, 3]
-        flow_old        : [E_old, 1]
-        edge_index_new  : [2, E_new]
-        edge_attr_new   : [E_new, 3]
-        total_nodes     : int
-
-      Output:
-        aligned_features : [E_new, 8]
-    """
+    def __init__(self, mode: str = "full") -> None:
+        super().__init__()
+        mode = str(mode).lower()
+        if mode not in ("full", "new_attr_only", "wo_old_flow"):
+            raise ValueError(f"Unsupported EdgeAlignmentModule mode: {mode}")
+        self.mode = mode
 
     def forward(
         self,
-        edge_index_old: torch.Tensor,   # [2, E_old]
-        edge_attr_old: torch.Tensor,    # [E_old, 3]
-        flow_old: torch.Tensor,         # [E_old, 1]
-        edge_index_new: torch.Tensor,   # [2, E_new]
-        edge_attr_new: torch.Tensor,    # [E_new, 3]
+        edge_index_old: torch.Tensor,
+        edge_attr_old: torch.Tensor,
+        flow_old: torch.Tensor,
+        edge_index_new: torch.Tensor,
+        edge_attr_new: torch.Tensor,
         total_nodes: int,
-    ) -> torch.Tensor:                  # → [E_new, 8]
-
+    ) -> torch.Tensor:
         device = edge_attr_new.device
-        dtype  = edge_attr_new.dtype
-        E_old  = edge_index_old.shape[1]
-        E_new  = edge_index_new.shape[1]
+        dtype = edge_attr_new.dtype
+        num_new_edges = edge_index_new.shape[1]
 
-        # -- Step 1: Encode edge node-pairs as unique integer keys ----------
-        #
-        # Formula: key(src, dst) = src × total_nodes + dst
-        #
-        # Rationale: Since 0 ≤ src, dst < total_nodes,
-        #   any distinct (src, dst) produces distinct key—equiv. to
-        #   flattening 2D index to 1D (row-major order).
-        #
-        # Time complexity: O(E_old + E_new), no Python for-loops.
         match_idx = match_edge_indices(
             edge_index_old=edge_index_old,
             edge_index_new=edge_index_new,
             total_nodes=total_nodes,
         )
 
-        # -- Step 4: Construct aligned features from old graph side (4 dims)
-        #
-        # Retained edge: use real old features + old flows
-        # Added edge: fill zeros (representing "did not exist before")
-        #
-        # old_feats[j] = cat([edge_attr_old[j], flow_old[j]]) shape [4]
-        old_feats = torch.cat([edge_attr_old, flow_old], dim=-1)  # [E_old, 4]
-
-        # Initialize zero matrix (default: all-added edges are zero from old side)
-        aligned_old = torch.zeros(E_new, 4, dtype=dtype, device=device)
-
-        # Boolean mask: mark which new edges exist in old graph (retained)
-        retained_mask = match_idx >= 0  # [E_new], bool
-
-        # Only fill for retained edges, avoid -1 index out of bound
+        old_feats = torch.cat([edge_attr_old, flow_old], dim=-1)
+        aligned_old = torch.zeros(num_new_edges, 4, dtype=dtype, device=device)
+        retained_mask = match_idx >= 0
         if retained_mask.any():
-            # aligned_old[retained_mask] ← old_feats[match_idx[retained_mask]]
-            # pure tensor indexing, no Python loops
             aligned_old[retained_mask] = old_feats[match_idx[retained_mask]]
 
-        # -- Step 5: Build is_new_edge indicator ---------------------------
-        #
-        # is_new_edge = 1 marks new edge (not exist in old graph), model can distinguish
-        # is_new_edge = 0 marks retained edge (exist in old graph)
-        # Shape: [E_new, 1], float dtype for use in linear layers
-        is_new_edge = (~retained_mask).to(dtype).unsqueeze(1)  # [E_new, 1]
+        is_new_edge = (~retained_mask).to(dtype).unsqueeze(1)
+        aligned_features = torch.cat([aligned_old, edge_attr_new, is_new_edge], dim=-1)
 
-        # -- Step 6: Concatenate final aligned feature ---------------------
-        #
-        # Retained edge: [edge_attr_old(3), flow_old(1), edge_attr_new(3), 0(1)] = 8
-        # New edge:      [zeros(3),        zero(1),      edge_attr_new(3), 1(1)] = 8
-        # Shape strictly [E_new, 8]
-        aligned_features = torch.cat(
-            [aligned_old, edge_attr_new, is_new_edge], dim=-1
-        )  # [E_new, 8]
+        if self.mode == "new_attr_only":
+            aligned_features = torch.cat(
+                [
+                    torch.zeros_like(aligned_old),
+                    edge_attr_new,
+                    torch.zeros_like(is_new_edge),
+                ],
+                dim=-1,
+            )
+        elif self.mode == "wo_old_flow":
+            aligned_features = torch.cat(
+                [
+                    aligned_old[:, :3],
+                    torch.zeros(num_new_edges, 1, dtype=dtype, device=device),
+                    edge_attr_new,
+                    is_new_edge,
+                ],
+                dim=-1,
+            )
 
         return aligned_features
 
 
-# ============================================================
-# Implicit Demand Virtual Routing Layer (Implicit Virtual Edge Layer)
-# ============================================================
+class RMSNorm(nn.Module):
+    """Root-mean-square normalization over the hidden dimension."""
 
-class ImplicitVirtualRoutingLayer(nn.Module):
-    r"""
-    Implicit demand virtual routing layer -- uses global self-attention to break the locality limitation of GNN receptive field.
-
-    Physical meaning:
-      When a traffic network experiences disconnects or dramatic changes in attributes, flows get redistributed globally.
-      Traditional GNN aggregates only 1-hop neighbors per layer, thus for flow transfer between distant OD pairs,
-      many layers must be stacked to propagate the signal, but this can cause over-smoothing.
-
-      This layer computes self-attention weights among all nodes within the same graph,
-      equivalent to dynamically establishing "implicit virtual edges" (Implicit Virtual Links):
-        - High attention score $\alpha_{ij}$ → strong association between node $i$ and $j$
-          (potential OD relationship, alternative path relationship, flow conservation constraint relationship)
-        - These virtual edges allow global flow redistribution signals to be transmitted in a single layer
-
-      Mathematical expression:
-        $$\text{Attention}(Q, K, V) = \text{softmax}\!\left(\frac{QK^T}{\sqrt{d_k}}\right) V$$
-
-      Architecture (Post-LN Transformer Block):
-        $$\mathbf{x}_{\text{mid}} = \text{LN}\!\left(\mathbf{x} + \text{MHA}(\mathbf{x})\right)$$
-        $$\mathbf{x}_{\text{out}} = \text{LN}\!\left(\mathbf{x}_{\text{mid}} + \text{FFN}(\mathbf{x}_{\text{mid}})\right)$$
-
-    Batch safety (strictly prevents cross-graph contamination):
-      PyG's to_dense_batch transforms flat [N, H] → [B, Max_N, H] dense tensors,
-      together with key_padding_mask=~mask passed to MultiheadAttention, ensures:
-        1. Padding positions (dummy nodes) do not participate in attention computation
-        2. Nodes from different graphs will never communicate with each other
-    """
-
-    def __init__(
-        self,
-        hidden_dim: int,
-        num_heads: int = 4,
-        dropout: float = 0.1,
-    ) -> None:
+    def __init__(self, hidden_dim: int, eps: float = 1e-6) -> None:
         super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(hidden_dim))
 
-        # Multi-head self-attention: establish global implicit virtual edges within the same graph
-        # batch_first=True → input/output format [B, Seq, H], consistent with to_dense_batch output
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        scale = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        return x * scale * self.weight
+
+
+def _parse_multiplier(value) -> float:
+    if isinstance(value, str):
+        value = value.strip()
+        if "/" in value:
+            numerator, denominator = value.split("/", 1)
+            return float(numerator) / float(denominator)
+    return float(value)
+
+
+def _make_norm(norm_type: str, hidden_dim: int) -> nn.Module:
+    norm_type = str(norm_type).lower()
+    if norm_type == "layernorm":
+        return nn.LayerNorm(hidden_dim)
+    if norm_type == "rmsnorm":
+        return RMSNorm(hidden_dim)
+    raise ValueError("norm_type must be one of: 'layernorm', 'rmsnorm'")
+
+
+class SwiGLUFFN(nn.Module):
+    """SwiGLU feed-forward block with configurable expansion."""
+
+    def __init__(self, hidden_dim: int, ffn_mult, dropout: float) -> None:
+        super().__init__()
+        inner_dim = max(1, int(round(hidden_dim * _parse_multiplier(ffn_mult))))
+        self.gate_proj = nn.Linear(hidden_dim, inner_dim)
+        self.up_proj = nn.Linear(hidden_dim, inner_dim)
+        self.down_proj = nn.Linear(inner_dim, hidden_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = torch.nn.functional.silu(self.gate_proj(x)) * self.up_proj(x)
+        return self.dropout(self.down_proj(x))
+
+
+def _make_ffn(ffn_type: str, hidden_dim: int, ffn_mult, dropout: float) -> nn.Module:
+    ffn_type = str(ffn_type).lower()
+    if ffn_type == "swiglu":
+        return SwiGLUFFN(hidden_dim, ffn_mult=ffn_mult, dropout=dropout)
+
+    inner_dim = max(1, int(round(hidden_dim * _parse_multiplier(ffn_mult))))
+    if ffn_type == "relu":
+        activation: nn.Module = nn.ReLU()
+    elif ffn_type == "gelu":
+        activation = nn.GELU()
+    else:
+        raise ValueError("ffn_type must be one of: 'relu', 'gelu', 'swiglu'")
+
+    return nn.Sequential(
+        nn.Linear(hidden_dim, inner_dim),
+        activation,
+        nn.Dropout(dropout),
+        nn.Linear(inner_dim, hidden_dim),
+        nn.Dropout(dropout),
+    )
+
+
+class TransformerSelfAttentionBlock(nn.Module):
+    """Dense self-attention block for graph-local node or edge tokens."""
+
+    def __init__(self, hidden_dim: int, num_heads: int = 4, dropout: float = 0.1) -> None:
+        super().__init__()
+        self.num_heads = int(num_heads)
         self.attn = nn.MultiheadAttention(
             embed_dim=hidden_dim,
-            num_heads=num_heads,
+            num_heads=self.num_heads,
             dropout=dropout,
             batch_first=True,
         )
-
-        # Post-Attention LayerNorm (normalize after residual fusion)
-        self.norm1 = nn.LayerNorm(hidden_dim)
-        # Post-FFN LayerNorm
-        self.norm2 = nn.LayerNorm(hidden_dim)
-
-        # Feed Forward Network (FFN): two Linear + ReLU layers, standard 4x expansion ratio
-        # Function: applies nonlinear transform to globally aggregated information from attention
-        self.ffn = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim * 4),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim * 4, hidden_dim),
-            nn.Dropout(dropout),
+        self.dropout = nn.Dropout(dropout)
+        self.norm1 = _make_norm(
+            getattr(cfg.topology_gnn, "norm_type", "layernorm"),
+            hidden_dim,
         )
+        self.norm2 = _make_norm(
+            getattr(cfg.topology_gnn, "norm_type", "layernorm"),
+            hidden_dim,
+        )
+        self.ffn = _make_ffn(
+            getattr(cfg.topology_gnn, "ffn_type", "relu"),
+            hidden_dim,
+            getattr(cfg.topology_gnn, "ffn_mult", 4.0),
+            dropout,
+        )
+        self.norm_position = str(getattr(cfg.topology_gnn, "norm_position", "post")).lower()
+        if self.norm_position not in ("pre", "post"):
+            raise ValueError("norm_position must be one of: 'pre', 'post'")
 
-    def forward(
+    def _attention(
         self,
-        x: torch.Tensor,      # [N, hidden_dim]  flat node features
-        batch: torch.Tensor,   # [N]             node belong-to index
-    ) -> torch.Tensor:         # → [N, hidden_dim]
-        """
-        Forward pass: global self-attention → residual + LayerNorm → FFN → residual + LayerNorm.
+        x: torch.Tensor,
+        mask: torch.Tensor,
+        attn_bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        attn_mask = None
+        if attn_bias is not None:
+            if attn_bias.dim() != 3:
+                raise ValueError("attn_bias must have shape [batch, target_len, source_len]")
+            batch_size, target_len, source_len = attn_bias.shape
+            attn_mask = attn_bias[:, None, :, :].expand(
+                batch_size,
+                self.num_heads,
+                target_len,
+                source_len,
+            )
+            attn_mask = attn_mask.reshape(batch_size * self.num_heads, target_len, source_len)
 
-        Args:
-            x     : Flat node features. Nodes of all graphs in batch concatenated together. Shape [N, H]
-            batch : Node assignment indices; the i-th node belongs to batch[i]-th graph. Shape [N]
-
-        Returns:
-            x_flat : Node features with global perspective (contains implicit virtual edge information), shape [N, H]
-        """
-        # -- Step A: Dense transformation --------------------------------
-        # Transform flat [N, H] into 3D dense tensor [B, Max_N, H]
-        # mask: [B, Max_N], True = real node, False = padding (filled with 0)
-        # Physical meaning: aligns node lists for each graph in mini-batch to same-length sequences
-        #                   for Self-Attention matrix ops
-        x_dense, mask = to_dense_batch(x, batch)  # [B, Max_N, H], [B, Max_N]
-
-        # -- Step B: Global self-attention (establish implicit virtual edges) -----------
-        # key_padding_mask=~mask: Positions with value True are ignored by attention
-        #   → Padding nodes neither generate nor receive attention
-        #   → Nodes in different graphs never communicate (because they're on different batch dimension)
-        # Physical meaning: each node calculates attention with all other nodes in the same graph,
-        #                   building feature similarity-based "implicit virtual edges",
-        #                   so that potential OD and alternative path relations are captured instantly
         attn_out, _ = self.attn(
-            query=x_dense,
-            key=x_dense,
-            value=x_dense,
+            query=x,
+            key=x,
+            value=x,
+            attn_mask=attn_mask,
             key_padding_mask=~mask,
-        )  # [B, Max_N, H]
-
-        # -- Step C: Residual connection + LayerNorm (Post-Attention) -----
-        # $\mathbf{x}_{\text{mid}} = \text{LN}(\mathbf{x} + \text{MHA}(\mathbf{x}))$
-        # Residual connection retains original local features, with attention output adding global info
-        x_dense = self.norm1(x_dense + attn_out)  # [B, Max_N, H]
-
-        # -- Step D: FFN + residual + LayerNorm ---------------------------
-        # $\mathbf{x}_{\text{out}} = \text{LN}(\mathbf{x}_{\text{mid}} + \text{FFN}(\mathbf{x}_{\text{mid}}))$
-        ffn_out = self.ffn(x_dense)                # [B, Max_N, H]
-        x_dense = self.norm2(x_dense + ffn_out)    # [B, Max_N, H]
-
-        # -- Step E: Restore as flat format -------------------------------
-        # Use mask boolean indexing to select real nodes, filter out padding
-        # The number of True in mask matches N (number of all real nodes), dimension matches strictly
-        x_flat = x_dense[mask]  # [N, H]
-
-        return x_flat
-
-
-# ============================================================
-# Module 3: NewGraphReasoner (reasoner for new topology)
-# ============================================================
-
-class NewGraphReasoner(nn.Module):
-    """
-    Fuses historical memory and reasons future equilibrium flows over new graph G'.
-
-    Node Fusion principle (critical constraint):
-      x_new_init = ones(N, H)           ← blank node for new graph
-      x_fused    = cat([x_new_init, h_nodes_old])  → [N, 2H]
-      x          = node_fusion(x_fused)            → [N, H]
-
-      ⚠️  Strictly forbid residual connections after node_fusion!
-          Residual x = x_fused_proj + h_nodes_old makes a "memory shortcut",
-          letting the model copy old flows and bypass learning new topology.
-          Force nonlinear compression (Linear→ReLU→Dropout) to ensure the model
-          rediscover flow patterns by new graph message passing.
-
-    Edge Decoder design:
-      Input = cat([x_src(H), x_dst(H), aligned_features(8)]) → [2H + 8]
-      Output = flow_pred [E_new, 1]
-      Last layer is a pure linear, no activation (Unbounded Output).
-      Target has been StandardScaler-normalized (mean 0, std 1, can be negative),
-      any bounded activation (like ReLU/Sigmoid) introduces distribution bias.
-
-    Tensor shape conventions (H = hidden_dim):
-      Input:
-        edge_index_new   : [2, E_new]
-        aligned_features : [E_new, 8]
-        h_nodes_old      : [num_nodes, H]
-        num_nodes        : int
-
-      Output:
-        flow_pred : [E_new, 1]
-    """
-
-    def __init__(
-        self,
-        hidden_dim: int,
-        num_layers: int,
-        dropout: float,
-        residual: bool,
-        num_heads: int = 4,
-    ) -> None:
-        super().__init__()
-        self.hidden_dim = hidden_dim
-
-        # -- Node Fusion layer --------------------------------------------
-        # Input: cat([x_new_init(H), h_nodes_old(H)]) → [N, 2H]
-        # Output: [N, H]
-        #
-        # Principle: Nonlinear compression forces a dynamic balance between
-        # the "blank" (for new topology adaptation) and "historical memory" (old flow pattern).
-        # Strictly no residual — avoids degenerate strategies that just outputs old flows.
-        self.node_fusion = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
+            need_weights=False,
         )
-
-        # -- Implicit Demand Virtual Routing Layer (Implicit Virtual Routing) -------------
-        # After node_fusion output and before GatedGCN local message passing,
-        # inject full-graph perspective to each node via global self-attention,
-        # overcoming GNN shortsightedness, allowing far-end flow redistribution signals
-        # to propagate instantly.
-        # Controlled by cfg.dataset.use_virtual_links (default True).
-        self.use_virtual_links = cfg.dataset.use_virtual_links
-        if self.use_virtual_links:
-            self.virtual_routing = ImplicitVirtualRoutingLayer(
-                hidden_dim=hidden_dim,
-                num_heads=num_heads,
-                dropout=dropout,
-            )
-
-        # Project the aligned edge features: [E_new, 8] → [E_new, H]
-        # GatedGCNLayer requires same dimension for node and edge features
-        self.edge_proj = nn.Linear(8, hidden_dim)
-
-        # Stacked GatedGCN layers: multi-round message passing on new graph topology
-        self.gnn_layers = nn.ModuleList([
-            GatedGCNLayer(
-                in_dim=hidden_dim,
-                out_dim=hidden_dim,
-                dropout=dropout,
-                residual=residual,
-            )
-            for _ in range(num_layers)
-        ])
-
-        # -- Edge-level flow decoder --------------------------------------
-        # Input: cat([x_src(H), x_dst(H), aligned_features(8)]) → [2H + 8]
-        #
-        # Principle: Explicitly fuses "source node state + target node state + edge features";
-        # better captures directional flow laws than decoding from edge only.
-        # aligned_features retains original 8 dims (including is_new_edge bit);
-        # allows decoder to distinguish new/retained edges and predict them differently.
-        #
-        # Last layer: nn.Linear(H, 1), no activation (Unbounded Output).
-        decoder_in_dim = hidden_dim * 2 + 8
-        self.edge_decoder = nn.Sequential(
-            nn.Linear(decoder_in_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 1),
-            # ⚠️  Intentionally omit activation here!
-            # StandardScaler-processed targets span (−∞, +∞),
-            # any bounded activation (ReLU/Tanh/Sigmoid) will bias predictions.
-        )
+        return self.dropout(attn_out)
 
     def forward(
         self,
-        edge_index_new: torch.Tensor,    # [2, E_new]
-        aligned_features: torch.Tensor,  # [E_new, 8]
-        h_nodes_old: torch.Tensor,       # [num_nodes, H]
-        num_nodes: int,
-        batch_vec: torch.Tensor,         # [num_nodes] node assignment index (must be provided by PyG Batch)
-    ) -> torch.Tensor:                   # → [E_new, 1]
+        x: torch.Tensor,
+        mask: torch.Tensor,
+        attn_bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if self.norm_position == "pre":
+            x = x + self._attention(self.norm1(x), mask, attn_bias=attn_bias)
+            x = x + self.ffn(self.norm2(x))
+            return x
 
-        device = h_nodes_old.device
-        dtype  = h_nodes_old.dtype
-
-        # -- Blank node initialization (new graph) ------------------------
-        # x_new_init represents "no prior knowledge" for new graph.
-        # After fusing with h_nodes_old, model must (re)assign flows by new topology,
-        # not just inherit old states.
-        # Shape: [num_nodes, H]
-        x_new_init = torch.ones(num_nodes, self.hidden_dim, device=device, dtype=dtype)
-
-        # -- Historical memory fusion (Node Fusion) ------------------------
-        # Concatenate blank node with historical embedding: [N, H] || [N, H] → [N, 2H]
-        # Then nonlinearly compress: [N, 2H] → [N, H]
-        #
-        # ⚠️  No residual connection! x must be entirely determined by node_fusion nonlinear transform,
-        #     h_nodes_old can't shortcut to downstream network.
-        x_cat = torch.cat([x_new_init, h_nodes_old], dim=-1)  # [N, 2H]
-        x = self.node_fusion(x_cat)                            # [N, H]
-
-        # -- Implicit Demand Virtual Routing Layer (Implicit Virtual Routing) -------------------
-        if self.use_virtual_links:
-            assert batch_vec is not None, (
-                "batch_vec is None! ImplicitVirtualRoutingLayer requires PyG's batch.batch vector."
-            )
-            assert batch_vec.shape[0] == num_nodes, (
-                f"batch_vec length ({batch_vec.shape[0]}) does not match num_nodes ({num_nodes})!"
-            )
-            x = self.virtual_routing(x, batch_vec)  # [N, H], global implicit OD information fused
-
-        # -- Aligned edge feature projection -------------------------------
-        # Project 8-dim aligned feature into hidden space for GatedGCNLayer
-        # Shape: [E_new, 8] → [E_new, H]
-        e = self.edge_proj(aligned_features)  # [E_new, H]
-
-        # -- Stacked message passing over new graph topology ---------------
-        # This is where model "understands" new topology:
-        #   - Added edges (is_new_edge=1) can propagate their physical attrs to neighbors
-        #   - Deleted edges disappear, flow redistributes over retained paths
-        for layer in self.gnn_layers:
-            mini_batch = _GNNBatch(x, e, edge_index_new)
-            mini_batch = layer(mini_batch)
-            x = mini_batch.x           # [num_nodes, H]
-            e = mini_batch.edge_attr   # [E_new, H]
-
-        # -- Edge-level flow decoding --------------------------------------
-        # For each new edge, extract src/dst node embeddings,
-        # concat with raw 8-dim aligned features (not projected), feed to decoder.
-        #
-        # Keep original aligned_features (not projected/e),
-        #   1. aligned_features contains is_new_edge indicator (explicitly shows new/retained)
-        #   2. Raw physical attrs (capacity, speed, length) have flow-related dimension,
-        #      directly feed un-distorted.
-        src_idx, dst_idx = edge_index_new[0], edge_index_new[1]
-        edge_repr = torch.cat(
-            [x[src_idx], x[dst_idx], aligned_features], dim=-1
-        )  # [E_new, 2H + 8]
-
-        flow_pred = self.edge_decoder(edge_repr)  # [E_new, 1]
-
-        return flow_pred
+        x = self.norm1(x + self._attention(x, mask, attn_bias=attn_bias))
+        x = self.norm2(x + self.ffn(x))
+        return x
 
 
-# ============================================================
-# Phase 3: DiffusionCell (Neural Darcy's Law — single step)
-# ============================================================
+class ImplicitVirtualRoutingLayer(nn.Module):
+    """Global node self-attention over each graph in the mini-batch."""
 
-class DiffusionCell(nn.Module):
-    r"""
-    One pseudo-time step of Neural Darcy's Law.
+    def __init__(self, hidden_dim: int, num_heads: int = 4, dropout: float = 0.1) -> None:
+        super().__init__()
+        self.block = TransformerSelfAttentionBlock(
+            hidden_dim=hidden_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+        )
 
-    Implements the dual-stream architecture specified in .cursorrules Phase 3:
+    def forward(self, x: torch.Tensor, batch: torch.Tensor) -> torch.Tensor:
+        x_dense, mask = to_dense_batch(x, batch)
+        x_dense = self.block(x_dense, mask)
+        return x_dense[mask]
 
-      $\mathbf{h}_e^{(k)} = \text{GNN\_with\_Global\_Attention}
-          \left(\mathbf{Attr}_e,\; \mathbf{h}_e^{(k-1)},\;
-                \rho_u^{(k-1)},\; \rho_v^{(k-1)}\right)$
 
-      $\Delta f_{e\_scaled}^{(k)} = \text{MLP\_Readout}(\mathbf{h}_e^{(k)})$
+class SharedEndpointAttentionBias(nn.Module):
+    """Learned edge attention bias for edge pairs that share graph endpoints."""
 
-    At each step k the cell:
-      1. Injects current physics state (ρ_src, ρ_dst, f_scaled) into edge hidden state
-      2. Injects current pressure ρ_v into node hidden state
-      3. Local stream:  GatedGCN message passing on edge_index_new
-      4. Global stream: Self-attention over all nodes (implicit virtual routing)
-      5. Decodes Δf_scaled (scalar flow change) from updated edge features
+    def __init__(self) -> None:
+        super().__init__()
+        # Query/key edge endpoint relations: src-src, src-dst, dst-src, dst-dst.
+        self.bias = nn.Parameter(torch.zeros(4))
 
-    Tensor conventions (H = hidden_dim):
-      Inputs:
-        h_v            : [N, H]       node hidden state
-        h_e            : [E_new, H]   edge hidden state
-        rho_v          : [N, 1]       node pressure (real space, veh/hr)
-        f_scaled_k     : [E_new, 1]   current scaled flow
-        edge_index_new : [2, E_new]   new graph connectivity
-        batch_vec      : [N]          node batch assignment
+    def forward(
+        self,
+        src_dense: torch.Tensor,
+        dst_dense: torch.Tensor,
+        edge_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        valid_pair = edge_mask.unsqueeze(2) & edge_mask.unsqueeze(1)
+        eye = torch.eye(edge_mask.shape[1], dtype=torch.bool, device=edge_mask.device)
+        valid_pair = valid_pair & ~eye.unsqueeze(0)
 
-      Outputs:
-        h_v_new        : [N, H]       updated node hidden state
-        h_e_new        : [E_new, H]   updated edge hidden state
-        delta_f_scaled : [E_new, 1]   predicted flow delta (unbounded)
-    """
+        src_q = src_dense.unsqueeze(2)
+        dst_q = dst_dense.unsqueeze(2)
+        src_k = src_dense.unsqueeze(1)
+        dst_k = dst_dense.unsqueeze(1)
+
+        bias = self.bias.new_zeros(src_dense.shape[0], src_dense.shape[1], src_dense.shape[1])
+        bias = bias + self.bias[0] * ((src_q == src_k) & valid_pair).to(bias.dtype)
+        bias = bias + self.bias[1] * ((src_q == dst_k) & valid_pair).to(bias.dtype)
+        bias = bias + self.bias[2] * ((dst_q == src_k) & valid_pair).to(bias.dtype)
+        bias = bias + self.bias[3] * ((dst_q == dst_k) & valid_pair).to(bias.dtype)
+        return bias
+
+
+class EdgeTransformerBackbone(nn.Module):
+    """Edge-token Transformer that updates edge states and derives node states."""
 
     def __init__(
         self,
@@ -622,34 +286,164 @@ class DiffusionCell(nn.Module):
         num_heads: int,
         dropout: float,
         residual: bool,
+        num_layers: int,
+        edge_to_node_agg: str,
+        edge_endpoint_mode: str,
     ) -> None:
         super().__init__()
+        self.residual = bool(residual)
+        self.edge_to_node_agg = str(edge_to_node_agg).lower()
+        if self.edge_to_node_agg not in ("mean", "sum"):
+            raise ValueError("edge_to_node_agg must be one of: 'mean', 'sum'")
+        edge_endpoint_mode = str(edge_endpoint_mode).lower()
+        if edge_endpoint_mode in ("shared_bias", "endpoint_bias"):
+            edge_endpoint_mode = "shared_endpoint_bias"
+        self.edge_endpoint_mode = edge_endpoint_mode
+        if self.edge_endpoint_mode not in ("fusion", "shared_endpoint_bias"):
+            raise ValueError(
+                "edge_endpoint_mode must be one of: 'fusion', 'shared_endpoint_bias'"
+            )
 
-        # Edge physics injection: fuse latent state with physical observables
-        # [h_e(H), ρ_src(1), ρ_dst(1), f_scaled(1)] → [H]
-        self.edge_inject = nn.Linear(hidden_dim + 3, hidden_dim)
-
-        # Node physics injection: fuse latent state with current pressure
-        # [h_v(H), ρ_v(1)] → [H]
-        self.node_inject = nn.Linear(hidden_dim + 1, hidden_dim)
-
-        # Local stream: GatedGCN for topology-aware message passing
-        self.local_gnn = GatedGCNLayer(
-            in_dim=hidden_dim,
-            out_dim=hidden_dim,
-            dropout=dropout,
-            residual=residual,
+        self.endpoint_proj = (
+            nn.Linear(hidden_dim * 2, hidden_dim)
+            if self.edge_endpoint_mode == "fusion"
+            else None
+        )
+        self.endpoint_attention_bias = (
+            SharedEndpointAttentionBias()
+            if self.edge_endpoint_mode == "shared_endpoint_bias"
+            else None
+        )
+        self.layers = nn.ModuleList(
+            [
+                TransformerSelfAttentionBlock(
+                    hidden_dim=hidden_dim,
+                    num_heads=num_heads,
+                    dropout=dropout,
+                )
+                for _ in range(max(1, int(num_layers)))
+            ]
+        )
+        self.node_update = nn.Sequential(
+            nn.Linear(hidden_dim * 3 + 1, hidden_dim),
+            _make_norm(getattr(cfg.topology_gnn, "norm_type", "layernorm"), hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
         )
 
-        # Global stream: self-attention for long-range flow redistribution
-        self.global_attn = ImplicitVirtualRoutingLayer(
-            hidden_dim=hidden_dim,
-            num_heads=num_heads,
-            dropout=dropout,
-        )
+    def _aggregate_edges(
+        self,
+        h_e: torch.Tensor,
+        index: torch.Tensor,
+        total_nodes: int,
+    ) -> torch.Tensor:
+        agg = h_e.new_zeros(total_nodes, h_e.shape[-1])
+        agg.scatter_add_(0, index.unsqueeze(-1).expand(-1, h_e.shape[-1]), h_e)
+        if self.edge_to_node_agg == "mean":
+            counts = h_e.new_zeros(total_nodes, 1)
+            counts.scatter_add_(0, index.unsqueeze(-1), h_e.new_ones(h_e.shape[0], 1))
+            agg = agg / counts.clamp_min(1.0)
+        return agg
 
-        # Δf readout: edge hidden → scalar delta flow
-        # Last layer has NO activation (delta can be positive or negative)
+    def forward(
+        self,
+        h_v: torch.Tensor,
+        h_e: torch.Tensor,
+        rho_v: torch.Tensor,
+        edge_index_new: torch.Tensor,
+        batch_vec: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        src, dst = edge_index_new[0], edge_index_new[1]
+        if self.edge_endpoint_mode == "fusion":
+            h_e = h_e + self.endpoint_proj(torch.cat([h_v[src], h_v[dst]], dim=-1))
+
+        edge_batch = batch_vec[src]
+        h_e_dense, edge_mask = to_dense_batch(h_e, edge_batch)
+        attn_bias = None
+        if self.edge_endpoint_mode == "shared_endpoint_bias":
+            src_dense, _ = to_dense_batch(src, edge_batch, fill_value=-1)
+            dst_dense, _ = to_dense_batch(dst, edge_batch, fill_value=-1)
+            attn_bias = self.endpoint_attention_bias(src_dense, dst_dense, edge_mask)
+            attn_bias = attn_bias.to(device=h_e_dense.device, dtype=h_e_dense.dtype)
+
+        for layer in self.layers:
+            h_e_dense = layer(h_e_dense, edge_mask, attn_bias=attn_bias)
+        h_e_new = h_e_dense[edge_mask]
+
+        total_nodes = int(h_v.shape[0])
+        incoming_agg = self._aggregate_edges(h_e_new, dst, total_nodes)
+        outgoing_agg = self._aggregate_edges(h_e_new, src, total_nodes)
+        node_input = torch.cat([h_v, incoming_agg, outgoing_agg, rho_v], dim=-1)
+        h_v_update = self.node_update(node_input)
+        h_v_new = h_v + h_v_update if self.residual else h_v_update
+        return h_v_new, h_e_new
+
+
+class DiffusionCell(nn.Module):
+    """One pseudo-time diffusion step."""
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_heads: int,
+        dropout: float,
+        residual: bool,
+        inject_rho_to_edges: bool = True,
+        inject_flow_to_edges: bool = True,
+        inject_rho_to_nodes: bool = True,
+        local_backbone: str = "gatedgcn",
+        num_edge_transformer_layers: int = 1,
+        edge_to_node_agg: str = "mean",
+        edge_endpoint_mode: str = "fusion",
+        enable_global_attn: bool = True,
+    ) -> None:
+        super().__init__()
+        self.inject_rho_to_edges = bool(inject_rho_to_edges)
+        self.inject_flow_to_edges = bool(inject_flow_to_edges)
+        self.inject_rho_to_nodes = bool(inject_rho_to_nodes)
+        self.local_backbone = str(local_backbone).lower()
+        if self.local_backbone not in ("gatedgcn", "edge_transformer"):
+            raise ValueError("local_backbone must be one of: 'gatedgcn', 'edge_transformer'")
+
+        edge_extra_dim = 0
+        if self.inject_rho_to_edges:
+            edge_extra_dim += 2
+        if self.inject_flow_to_edges:
+            edge_extra_dim += 1
+        self.edge_inject = nn.Linear(hidden_dim + edge_extra_dim, hidden_dim)
+
+        node_extra_dim = 1 if self.inject_rho_to_nodes else 0
+        self.node_inject = nn.Linear(hidden_dim + node_extra_dim, hidden_dim)
+
+        if self.local_backbone == "gatedgcn":
+            self.local_gnn = GatedGCNLayer(
+                in_dim=hidden_dim,
+                out_dim=hidden_dim,
+                dropout=dropout,
+                residual=residual,
+            )
+            self.edge_transformer = None
+        else:
+            self.local_gnn = None
+            self.edge_transformer = EdgeTransformerBackbone(
+                hidden_dim=hidden_dim,
+                num_heads=num_heads,
+                dropout=dropout,
+                residual=residual,
+                num_layers=num_edge_transformer_layers,
+                edge_to_node_agg=edge_to_node_agg,
+                edge_endpoint_mode=edge_endpoint_mode,
+            )
+        self.global_attn = (
+            ImplicitVirtualRoutingLayer(
+                hidden_dim=hidden_dim,
+                num_heads=num_heads,
+                dropout=dropout,
+            )
+            if bool(enable_global_attn)
+            else None
+        )
         self.delta_readout = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
@@ -659,519 +453,331 @@ class DiffusionCell(nn.Module):
 
     def forward(
         self,
-        h_v: torch.Tensor,             # [N, H]
-        h_e: torch.Tensor,             # [E_new, H]
-        rho_v: torch.Tensor,           # [N, 1]
-        f_scaled_k: torch.Tensor,      # [E_new, 1]
-        edge_index_new: torch.Tensor,  # [2, E_new]
-        batch_vec: torch.Tensor,       # [N]
+        h_v: torch.Tensor,
+        h_e: torch.Tensor,
+        rho_v: torch.Tensor,
+        f_scaled_k: torch.Tensor,
+        edge_index_new: torch.Tensor,
+        batch_vec: torch.Tensor,
         apply_global_attn: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-
         src, dst = edge_index_new[0], edge_index_new[1]
 
-        # ── Step 1: Inject physics into edge representations ──────────────
-        # The GNN "observes" the pressure gradient (ρ_src - ρ_dst) and current
-        # flow through each edge, enabling physically-informed flow prediction.
-        rho_src = rho_v[src]                                              # [E_new, 1]
-        rho_dst = rho_v[dst]                                              # [E_new, 1]
-        e_input = torch.cat([h_e, rho_src, rho_dst, f_scaled_k], dim=-1) # [E_new, H+3]
-        h_e_injected = self.edge_inject(e_input)                          # [E_new, H]
+        edge_parts = [h_e]
+        if self.inject_rho_to_edges:
+            edge_parts.extend([rho_v[src], rho_v[dst]])
+        if self.inject_flow_to_edges:
+            edge_parts.append(f_scaled_k)
+        h_e_injected = self.edge_inject(torch.cat(edge_parts, dim=-1))
 
-        # ── Step 2: Inject physics into node representations ──────────────
-        v_input = torch.cat([h_v, rho_v], dim=-1)                        # [N, H+1]
-        h_v_injected = self.node_inject(v_input)                          # [N, H]
+        if self.inject_rho_to_nodes:
+            h_v_injected = self.node_inject(torch.cat([h_v, rho_v], dim=-1))
+        else:
+            h_v_injected = self.node_inject(h_v)
 
-        # ── Step 3: Local stream — GatedGCN message passing ──────────────
-        mini = _GNNBatch(h_v_injected, h_e_injected, edge_index_new)
-        mini = self.local_gnn(mini)
-        h_v_new = mini.x                                                  # [N, H]
-        h_e_new = mini.edge_attr                                          # [E_new, H]
+        if self.local_backbone == "gatedgcn":
+            mini = _GNNBatch(h_v_injected, h_e_injected, edge_index_new)
+            mini = self.local_gnn(mini)
+            h_v_new = mini.x
+            h_e_new = mini.edge_attr
+        else:
+            h_v_new, h_e_new = self.edge_transformer(
+                h_v=h_v_injected,
+                h_e=h_e_injected,
+                rho_v=rho_v,
+                edge_index_new=edge_index_new,
+                batch_vec=batch_vec,
+            )
 
-        # ── Step 4: Global stream — Self-attention (virtual routing) ─────
-        if apply_global_attn:
-            h_v_new = self.global_attn(h_v_new, batch_vec)                # [N, H]
+        if apply_global_attn and self.global_attn is not None:
+            h_v_new = self.global_attn(h_v_new, batch_vec)
 
-        # ── Step 5: Readout Δf_scaled ─────────────────────────────────────
-        delta_f_scaled = self.delta_readout(h_e_new)                      # [E_new, 1]
-
+        delta_f_scaled = self.delta_readout(h_e_new)
         return h_v_new, h_e_new, delta_f_scaled
 
 
-# ============================================================
-# Main model: NetworkPairsTopologyModel
-# ============================================================
+def _replace_bn_with_ln(module: nn.Module) -> None:
+    for name, child in module.named_children():
+        if "BatchNorm" in child.__class__.__name__:
+            setattr(module, name, nn.LayerNorm(child.num_features))
+        else:
+            _replace_bn_with_ln(child)
 
-@register_network('topology_gnn')
+
+def _zero_bias(module: nn.Module) -> None:
+    if getattr(module, "bias", None) is not None:
+        nn.init.zeros_(module.bias)
+
+
+def _init_linear(module: nn.Linear, init_type: str, weight_scale: float = 1.0) -> None:
+    if init_type == "kaiming":
+        nn.init.kaiming_uniform_(module.weight, nonlinearity="relu")
+    elif init_type == "xavier":
+        nn.init.xavier_uniform_(module.weight)
+    else:
+        raise ValueError("init_type must be one of: 'kaiming', 'xavier'")
+    if weight_scale != 1.0:
+        with torch.no_grad():
+            module.weight.mul_(float(weight_scale))
+    _zero_bias(module)
+
+
+def _apply_variance_controlled_initialization(
+    module: nn.Module,
+    residual_scale: float,
+    delta_scale: float,
+) -> None:
+    """Initialize projections to preserve signal scale in the diffusion loop."""
+    residual_scale = float(residual_scale)
+    delta_scale = float(delta_scale)
+    initialized_linears = set()
+
+    for child in module.modules():
+        if isinstance(child, nn.MultiheadAttention):
+            nn.init.xavier_uniform_(child.in_proj_weight)
+            if child.in_proj_bias is not None:
+                nn.init.zeros_(child.in_proj_bias)
+            _init_linear(child.out_proj, "xavier", weight_scale=residual_scale)
+            initialized_linears.add(id(child.out_proj))
+
+    for name, child in module.named_modules():
+        if isinstance(child, (nn.LayerNorm, RMSNorm)):
+            if getattr(child, "weight", None) is not None:
+                nn.init.ones_(child.weight)
+            if getattr(child, "bias", None) is not None:
+                nn.init.zeros_(child.bias)
+            continue
+        if not isinstance(child, nn.Linear) or id(child) in initialized_linears:
+            continue
+
+        if name.endswith("delta_readout.3"):
+            _init_linear(child, "xavier", weight_scale=delta_scale)
+        elif name.endswith("delta_readout.0"):
+            _init_linear(child, "kaiming")
+        elif name.endswith("node_update.0"):
+            _init_linear(child, "kaiming")
+        elif name.endswith("node_update.4") or name.endswith("down_proj"):
+            _init_linear(child, "xavier", weight_scale=residual_scale)
+        else:
+            _init_linear(child, "xavier")
+
+
+def _safe_std(tensor: torch.Tensor) -> torch.Tensor:
+    tensor = tensor.detach().float()
+    if tensor.numel() <= 1:
+        return tensor.new_zeros(())
+    return tensor.std(unbiased=False)
+
+
+@register_network("topology_gnn")
 class NetworkPairsTopologyModel(nn.Module):
-    r"""
-    ST-PINN: Pseudo-Spatiotemporal Physics-Informed Diffusion Model
-    for traffic network topology reconfiguration.
-
-    Self-driven physical simulator that unrolls K pseudo-time diffusion
-    steps to predict new equilibrium flows without any OD matrix.
-
-    Submodules:
-      self.aligner          : EdgeAlignmentModule   (static edge context, no params)
-      self.edge_init_proj   : Linear(8 → H)         (project aligned features → h_e^(0))
-      self.diffusion_cell   : DiffusionCell          (shared-weight recurrent cell)
-
-    Registered buffers:
-      self.flow_mean : [1]  flow scaler μ (veh/hr)
-      self.flow_std  : [1]  flow scaler σ (veh/hr)
-
-    Expected PyG Batch fields:
-      batch.edge_index_old : [2, E_old]    old graph connectivity (node offset done)
-      batch.edge_attr_old  : [E_old, 3]    old graph physical attrs (normalized)
-      batch.flow_old       : [E_old, 1]    old graph flows (normalized)
-      batch.edge_index_new : [2, E_new]    new graph connectivity (node offset done)
-      batch.edge_attr_new  : [E_new, 3]    new graph physical attrs (normalized)
-      batch.y              : [E_new, 1]    ground truth flows (normalized)
-      batch.net_demand     : [N]           real-space D_v (veh/hr)
-      batch.batch          : [N]           node-to-graph assignment
-
-    Outputs attached to batch (for Phase 4 loss):
-      batch.rho_v_final   : [N, 1]          terminal pressure ρ^(K) (real space)
-      batch.rho_v_history : list of [N, 1]  pressure trajectory ρ^(0)…ρ^(K)
-
-    Args:
-        dim_in  : placeholder (GraphGym API), not used
-        dim_out : placeholder (GraphGym API), output dim always 1
-    """
+    """ST-PINN diffusion-only model."""
 
     def __init__(self, dim_in: int, dim_out: int) -> None:
+        del dim_in, dim_out
         super().__init__()
 
-        # ── Phase 2: Register flow scaler statistics as non-learnable buffers ──
-        # These are loaded from flow_scaler.pkl by preformat_NetworkPairs() in master_loader.py
-        # and written to cfg.dataset before the model is constructed.
-        # register_buffer ensures:
-        #   1. Auto-device sync (moves to GPU with model.to(device))
-        #   2. Saved/loaded with state_dict (checkpoint persistence)
-        #   3. NOT treated as learnable parameters (no gradients)
         self.register_buffer(
-            'flow_mean', torch.tensor([cfg.dataset.flow_mean], dtype=torch.float32)
+            "flow_mean",
+            torch.tensor([cfg.dataset.flow_mean], dtype=torch.float32),
         )
         self.register_buffer(
-            'flow_std', torch.tensor([cfg.dataset.flow_std], dtype=torch.float32)
+            "flow_std",
+            torch.tensor([cfg.dataset.flow_std], dtype=torch.float32),
         )
 
-        # Read hyperparams from cfg.topology_gnn
-        hidden_dim = cfg.topology_gnn.hidden_dim
-        dropout    = cfg.topology_gnn.dropout
-        residual   = cfg.topology_gnn.residual
-        num_heads  = cfg.topology_gnn.num_heads
-        self.K           = cfg.topology_gnn.num_diffusion_steps
-        self.attention_every_k_steps = int(
-            getattr(cfg.topology_gnn, 'attention_every_k_steps', 1)
+        hidden_dim = int(cfg.topology_gnn.hidden_dim)
+        dropout = float(cfg.topology_gnn.dropout)
+        residual = bool(cfg.topology_gnn.residual)
+        num_heads = int(cfg.topology_gnn.num_heads)
+
+        self.hidden_dim = hidden_dim
+        self.K = int(cfg.topology_gnn.num_diffusion_steps)
+        self.attention_every_k_steps = int(getattr(cfg.topology_gnn, "attention_every_k_steps", 1))
+        self.enable_global_attn = bool(getattr(cfg.topology_gnn, "enable_global_attn", True))
+        self.inject_rho_to_edges = bool(getattr(cfg.topology_gnn, "inject_rho_to_edges", True))
+        self.inject_flow_to_edges = bool(getattr(cfg.topology_gnn, "inject_flow_to_edges", True))
+        self.inject_rho_to_nodes = bool(getattr(cfg.topology_gnn, "inject_rho_to_nodes", True))
+        self.initial_flow_mode = str(
+            getattr(cfg.topology_gnn, "initial_flow_mode", "old_flow_warm_start")
+        ).lower()
+        self.initial_pressure_mode = str(
+            getattr(cfg.topology_gnn, "initial_pressure_mode", "from_initial_flow")
+        ).lower()
+        self.pressure_update_mode = str(getattr(cfg.topology_gnn, "pressure_update_mode", "lwr")).lower()
+        self.share_diffusion_cell = bool(getattr(cfg.topology_gnn, "share_diffusion_cell", True))
+        self.alignment_mode = str(getattr(cfg.topology_gnn, "alignment_mode", "full")).lower()
+        self.local_backbone = str(getattr(cfg.topology_gnn, "local_backbone", "gatedgcn")).lower()
+        self.num_edge_transformer_layers = int(
+            getattr(cfg.topology_gnn, "num_edge_transformer_layers", 1)
         )
-        self.enable_node_potential_head = bool(
-            getattr(cfg.model, 'enable_node_potential_head', False)
-            or float(getattr(cfg.model, 'lambda_rc', 0.0)) > 0.0
-        )
-<<<<<<< HEAD
-        self.enable_rerouting_residual_head = bool(
-            getattr(cfg.model, 'enable_rerouting_residual_head', False)
-            or float(getattr(cfg.model, 'lambda_reroute_residual', 0.0)) > 0.0
-        )
-=======
->>>>>>> 058655b286e2606488e7fb1e8072052dd458d355
-        self.hidden_dim  = hidden_dim
+        self.edge_to_node_agg = str(getattr(cfg.topology_gnn, "edge_to_node_agg", "mean")).lower()
+        self.edge_endpoint_mode = str(
+            getattr(cfg.topology_gnn, "edge_endpoint_mode", "fusion")
+        ).lower()
+        if self.edge_endpoint_mode in ("shared_bias", "endpoint_bias"):
+            self.edge_endpoint_mode = "shared_endpoint_bias"
+        self.ffn_type = str(getattr(cfg.topology_gnn, "ffn_type", "relu")).lower()
+        self.norm_type = str(getattr(cfg.topology_gnn, "norm_type", "layernorm")).lower()
+        self.norm_position = str(getattr(cfg.topology_gnn, "norm_position", "post")).lower()
+        self.init_scheme = str(getattr(cfg.topology_gnn, "init_scheme", "default")).lower()
+        self.init_residual_scale = float(getattr(cfg.topology_gnn, "init_residual_scale", 0.1))
+        self.init_delta_scale = float(getattr(cfg.topology_gnn, "init_delta_scale", 0.1))
+        self.log_variance_stats = bool(getattr(cfg.train, "log_variance_stats", False))
 
         if self.attention_every_k_steps < 1:
             raise ValueError("topology_gnn.attention_every_k_steps must be >= 1")
+        if self.pressure_update_mode not in ("lwr", "fixed_initial"):
+            raise ValueError(
+                "topology_gnn.pressure_update_mode must be one of: 'lwr', 'fixed_initial'"
+            )
+        if self.initial_flow_mode not in ("old_flow_warm_start", "zeros"):
+            raise ValueError(
+                "topology_gnn.initial_flow_mode must be one of: "
+                "'old_flow_warm_start', 'zeros'"
+            )
+        if self.initial_pressure_mode not in ("from_initial_flow", "zeros"):
+            raise ValueError(
+                "topology_gnn.initial_pressure_mode must be one of: "
+                "'from_initial_flow', 'zeros'"
+            )
+        if self.alignment_mode not in ("full", "new_attr_only", "wo_old_flow"):
+            raise ValueError(
+                "topology_gnn.alignment_mode must be one of: "
+                "'full', 'new_attr_only', 'wo_old_flow'"
+            )
+        if self.local_backbone not in ("gatedgcn", "edge_transformer"):
+            raise ValueError(
+                "topology_gnn.local_backbone must be one of: 'gatedgcn', 'edge_transformer'"
+            )
+        if self.num_edge_transformer_layers < 1:
+            raise ValueError("topology_gnn.num_edge_transformer_layers must be >= 1")
+        if self.edge_to_node_agg not in ("mean", "sum"):
+            raise ValueError("topology_gnn.edge_to_node_agg must be one of: 'mean', 'sum'")
+        if self.edge_endpoint_mode not in ("fusion", "shared_endpoint_bias"):
+            raise ValueError(
+                "topology_gnn.edge_endpoint_mode must be one of: "
+                "'fusion', 'shared_endpoint_bias'"
+            )
+        if self.ffn_type not in ("relu", "gelu", "swiglu"):
+            raise ValueError("topology_gnn.ffn_type must be one of: 'relu', 'gelu', 'swiglu'")
+        if self.norm_type not in ("layernorm", "rmsnorm"):
+            raise ValueError("topology_gnn.norm_type must be one of: 'layernorm', 'rmsnorm'")
+        if self.norm_position not in ("pre", "post"):
+            raise ValueError("topology_gnn.norm_position must be one of: 'pre', 'post'")
+        if self.init_scheme not in ("default", "variance_controlled"):
+            raise ValueError(
+                "topology_gnn.init_scheme must be one of: 'default', 'variance_controlled'"
+            )
 
-        # ── Static edge context encoder (for h_e^(0) initialization) ──────
-        # EdgeAlignmentModule produces 8-dim aligned features per new edge:
-        #   [edge_attr_old(3), flow_old(1), edge_attr_new(3), is_new_edge(1)]
-        # These encode the static "context" of each edge (its history & identity).
-        self.aligner = EdgeAlignmentModule()
+        self.aligner = EdgeAlignmentModule(mode=self.alignment_mode)
         self.edge_init_proj = nn.Linear(8, hidden_dim)
 
-        # ── Pseudo-time recurrent diffusion cell (shared weights ∀ k) ─────
-        # A single cell is unrolled K times in forward().
-        # Weight sharing is physically motivated: the same Darcy's law applies
-        # at every pseudo-time step; only the state (ρ, f) evolves.
-        self.diffusion_cell = DiffusionCell(
-            hidden_dim=hidden_dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            residual=residual,
-        )
-
-        # Lightweight node-potential head for the OD-free reduced-cost
-        # surrogate. The loss itself is applied outside forward().
-        if self.enable_node_potential_head:
-            self.node_potential_head = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-                nn.Linear(hidden_dim, 1),
+        if self.share_diffusion_cell:
+            self.diffusion_cell = DiffusionCell(
+                hidden_dim=hidden_dim,
+                num_heads=num_heads,
+                dropout=dropout,
+                residual=residual,
+                inject_rho_to_edges=self.inject_rho_to_edges,
+                inject_flow_to_edges=self.inject_flow_to_edges,
+                inject_rho_to_nodes=self.inject_rho_to_nodes,
+                local_backbone=self.local_backbone,
+                num_edge_transformer_layers=self.num_edge_transformer_layers,
+                edge_to_node_agg=self.edge_to_node_agg,
+                edge_endpoint_mode=self.edge_endpoint_mode,
+                enable_global_attn=self.enable_global_attn,
             )
+            self.diffusion_cells = None
         else:
-            self.node_potential_head = None
-
-<<<<<<< HEAD
-        # Separate rerouting-residual head for non-redundant Delta-f
-        # supervision. This keeps the main prediction as absolute final flow
-        # while giving the backbone a dedicated branch to model rerouting
-        # corrections relative to the projected initial flow.
-        if self.enable_rerouting_residual_head:
-            self.rerouting_residual_head = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-                nn.Linear(hidden_dim, 1),
+            self.diffusion_cell = None
+            self.diffusion_cells = nn.ModuleList(
+                [
+                    DiffusionCell(
+                        hidden_dim=hidden_dim,
+                        num_heads=num_heads,
+                        dropout=dropout,
+                        residual=residual,
+                        inject_rho_to_edges=self.inject_rho_to_edges,
+                        inject_flow_to_edges=self.inject_flow_to_edges,
+                        inject_rho_to_nodes=self.inject_rho_to_nodes,
+                        local_backbone=self.local_backbone,
+                        num_edge_transformer_layers=self.num_edge_transformer_layers,
+                        edge_to_node_agg=self.edge_to_node_agg,
+                        edge_endpoint_mode=self.edge_endpoint_mode,
+                        enable_global_attn=self.enable_global_attn,
+                    )
+                    for _ in range(self.K)
+                ]
             )
-        else:
-            self.rerouting_residual_head = None
 
-=======
->>>>>>> 058655b286e2606488e7fb1e8072052dd458d355
-        def replace_bn_with_ln(module):
-            for name, child in module.named_children():
-                if 'BatchNorm' in child.__class__.__name__:
-                    setattr(module, name, nn.LayerNorm(child.num_features))
-                else:
-                    replace_bn_with_ln(child)
-
-        replace_bn_with_ln(self)
-
-    # ================================================================
-    # Phase 2: Initial State Projection (k=0)
-    # ================================================================
+        _replace_bn_with_ln(self)
+        if self.init_scheme == "variance_controlled":
+            _apply_variance_controlled_initialization(
+                self,
+                residual_scale=self.init_residual_scale,
+                delta_scale=self.init_delta_scale,
+            )
 
     def _project_initial_flow(self, batch) -> torch.Tensor:
-        r"""
-        Project old equilibrium flows onto the new graph topology at pseudo-time k=0.
-
-        Uses hash-key encoding (identical scheme to EdgeAlignmentModule) for
-        fully vectorized, batch-safe edge matching:
-
-          key(src, dst) = src × total_nodes + dst
-
-        Mapping rules:
-          - Retained edge (exists in both G and G'):
-              f_scaled_0[e] = flow_old[matching_old_edge]  (already normalized)
-          - New edge (only in G'):
-              f_scaled_0[e] = (0.0 - μ) / σ  (representing exactly 0.0 real flow)
-
-        Args:
-            batch: PyG Batch object
-
-        Returns:
-            f_scaled_0: [E_new_total, 1]  initial edge flows in normalized space
-        """
         device = batch.flow_old.device
         dtype = batch.flow_old.dtype
-        total_nodes: int = batch.num_nodes
+        num_new_edges = batch.edge_index_new.shape[1]
 
-        E_old = batch.edge_index_old.shape[1]
-        E_new = batch.edge_index_new.shape[1]
+        scaled_zero = (-self.flow_mean / self.flow_std).item()
+        f_scaled_0 = torch.full((num_new_edges, 1), scaled_zero, device=device, dtype=dtype)
+        if self.initial_flow_mode == "zeros":
+            return f_scaled_0
 
-        # ── Hash-key encoding ──────────────────────────────────────────────
+        total_nodes = int(batch.num_nodes)
         match_idx = match_edge_indices(
             edge_index_old=batch.edge_index_old,
             edge_index_new=batch.edge_index_new,
             total_nodes=total_nodes,
         )
-        retained_mask = match_idx >= 0            # [E_new], bool
-
-        # ── Initialize: new edges → scaled representation of 0.0 real flow ─
-        scaled_zero = (-self.flow_mean / self.flow_std).item()  # scalar
-        f_scaled_0 = torch.full((E_new, 1), scaled_zero, device=device, dtype=dtype)
-
-        # ── Copy retained edges' historical flows ──────────────────────────
+        retained_mask = match_idx >= 0
         if retained_mask.any():
             f_scaled_0[retained_mask] = batch.flow_old[match_idx[retained_mask]]
-
         return f_scaled_0
 
-    def _compute_pressure_from_scaled_flow(
-        self,
-        f_scaled: torch.Tensor,
-        batch,
-    ) -> torch.Tensor:
-        """Compute rho = A f_real - D for any scaled flow tensor."""
+    def _compute_pressure_from_scaled_flow(self, f_scaled: torch.Tensor, batch) -> torch.Tensor:
         device = f_scaled.device
         dtype = f_scaled.dtype
-        total_nodes: int = batch.num_nodes
+        total_nodes = int(batch.num_nodes)
 
         f_real = f_scaled * self.flow_std + self.flow_mean
         f_real_flat = f_real.squeeze(-1)
 
         src = batch.edge_index_new[0]
         dst = batch.edge_index_new[1]
-
         inflow = torch.zeros(total_nodes, device=device, dtype=dtype)
         outflow = torch.zeros(total_nodes, device=device, dtype=dtype)
         inflow.scatter_add_(0, dst, f_real_flat)
         outflow.scatter_add_(0, src, f_real_flat)
 
-        divergence = inflow - outflow
         net_demand = batch.net_demand.to(device=device, dtype=dtype)
-        return (divergence - net_demand).unsqueeze(-1)
+        return (inflow - outflow - net_demand).unsqueeze(-1)
 
-    def _compute_initial_pressure(
-        self,
-        f_scaled_0: torch.Tensor,
-        batch,
-    ) -> torch.Tensor:
-        r"""
-        Compute initial node pressure ρ_v^(0) in real physical space (veh/hr).
-
-        This captures the flow imbalance ("pressure shockwave") caused by the
-        sudden topology change from G to G':
-
-          ρ_v^(0) = [ Σ_{e∈In(v)} f_{e,real}^{(0)} - Σ_{e∈Out(v)} f_{e,real}^{(0)} ] - D_v
-
-        where D_v = batch.net_demand (pre-computed in Phase 1 from flows_old divergence).
-
-        Physical meaning:
-          - ρ > 0  →  traffic accumulation (jam) at node v
-          - ρ < 0  →  demand void at node v
-          - ρ = 0  →  node is in equilibrium
-
-        Uses native PyTorch scatter_add_ for O(E) vectorized aggregation.
-
-        Args:
-            f_scaled_0: [E_new_total, 1]  initial flows in normalized space
-            batch:      PyG Batch object
-
-        Returns:
-            rho_v_0: [N_total, 1]  initial pressure in real space (veh/hr)
-        """
+    def _compute_initial_pressure(self, f_scaled_0: torch.Tensor, batch) -> torch.Tensor:
+        if self.initial_pressure_mode == "zeros":
+            return torch.zeros(
+                int(batch.num_nodes),
+                1,
+                device=f_scaled_0.device,
+                dtype=f_scaled_0.dtype,
+            )
         return self._compute_pressure_from_scaled_flow(f_scaled_0, batch)
 
-        device = f_scaled_0.device
-        dtype = f_scaled_0.dtype
-        total_nodes: int = batch.num_nodes
-
-        # ── Step 1: Convert to real physical space ─────────────────────────
-        f_real_0 = f_scaled_0 * self.flow_std + self.flow_mean   # [E_new, 1]
-        f_real_0_flat = f_real_0.squeeze(-1)                      # [E_new]
-
-        # ── Step 2: Scatter-add inflow / outflow per node ──────────────────
-        src = batch.edge_index_new[0]  # [E_new]
-        dst = batch.edge_index_new[1]  # [E_new]
-
-        inflow = torch.zeros(total_nodes, device=device, dtype=dtype)
-        outflow = torch.zeros(total_nodes, device=device, dtype=dtype)
-        inflow.scatter_add_(0, dst, f_real_0_flat)
-        outflow.scatter_add_(0, src, f_real_0_flat)
-
-        # ── Step 3: Pressure = (inflow - outflow) - D_v ───────────────────
-        divergence = inflow - outflow                                    # [N_total]
-        net_demand = batch.net_demand.to(device=device, dtype=dtype)     # [N_total]
-        rho_v_0 = (divergence - net_demand).unsqueeze(-1)                # [N_total, 1]
-
-        return rho_v_0
-
-    def _attach_real_new_edge_attrs(self, batch) -> None:
-        """Expose real new-graph edge attributes for future physics losses.
-
-        New processed datasets store raw edge attributes directly. For older
-        datasets, fall back to attr_scaler statistics loaded into cfg by the
-        dataset loader so reduced-cost experiments can still recover
-        capacity/speed/length without changing the main model inputs.
-        """
-        if hasattr(batch, 'edge_attr_new_real'):
-            edge_attr_new_real = batch.edge_attr_new_real.to(
-                device=batch.edge_attr_new.device,
-                dtype=batch.edge_attr_new.dtype,
-            )
-        else:
-            attr_mean = getattr(cfg.dataset, 'edge_attr_mean', [])
-            attr_std = getattr(cfg.dataset, 'edge_attr_std', [])
-            edge_dim = batch.edge_attr_new.shape[1]
-            if len(attr_mean) != edge_dim or len(attr_std) != edge_dim:
-                raise RuntimeError(
-                    "Reduced-cost surrogate requires real new-edge attributes. "
-                    "Expected either batch.edge_attr_new_real with columns "
-                    "[capacity, speed, length], or cfg.dataset.edge_attr_mean/std "
-                    "loaded from attr_scaler.pkl so the model can recover those "
-                    "real values from batch.edge_attr_new."
-                )
-            mean = batch.edge_attr_new.new_tensor(attr_mean).view(1, -1)
-            std = batch.edge_attr_new.new_tensor(attr_std).view(1, -1)
-            edge_attr_new_real = batch.edge_attr_new * std + mean
-
-        if not torch.isfinite(edge_attr_new_real).all():
-            bad = int((~torch.isfinite(edge_attr_new_real)).sum().item())
-            raise RuntimeError(
-                f"Recovered real new-edge attributes contain {bad} non-finite values. "
-                f"Reduced-cost surrogate needs finite capacity / speed / length."
-            )
-
-        capacity_new_real = edge_attr_new_real[:, 0:1]
-        speed_raw_new_real = edge_attr_new_real[:, 1:2]
-        length_new_real = edge_attr_new_real[:, 2:3]
-        if torch.any(capacity_new_real <= 0):
-            count = int((capacity_new_real <= 0).sum().item())
-            raise RuntimeError(
-                f"Reduced-cost surrogate requires strictly positive capacity on "
-                f"new edges, but found {count} invalid entries."
-            )
-        if torch.any(speed_raw_new_real <= 0):
-            count = int((speed_raw_new_real <= 0).sum().item())
-            raise RuntimeError(
-                f"Reduced-cost surrogate requires strictly positive speed on "
-                f"new edges, but found {count} invalid entries."
-            )
-        if torch.any(length_new_real <= 0):
-            count = int((length_new_real <= 0).sum().item())
-            raise RuntimeError(
-                f"Reduced-cost surrogate requires strictly positive length on "
-                f"new edges, but found {count} invalid entries."
-            )
-
-        speed_new_real = torch.clamp(speed_raw_new_real, min=1e-6)
-        free_flow_time_new_real = length_new_real / speed_new_real * 60.0
-        if not torch.isfinite(free_flow_time_new_real).all() or torch.any(free_flow_time_new_real <= 0):
-            raise RuntimeError(
-                "Recovered free-flow time contains invalid values. Please check "
-                "the real new-edge capacity / speed / length fields."
-            )
-
-        batch.edge_attr_new_real = edge_attr_new_real
-        batch.capacity_new_real = capacity_new_real
-        batch.speed_new_real = speed_new_real
-        batch.length_new_real = length_new_real
-        batch.free_flow_time_new_real = free_flow_time_new_real
-
-    def _attach_reduced_cost_state(
-        self,
-        batch,
-        f_scaled_final: torch.Tensor,
-        h_v_final: torch.Tensor,
-    ) -> None:
-        """Attach final-step real-space tensors for the OD-free RC surrogate.
-
-        This is not an exact UE / Beckmann path gap because no OD or path set
-        is available at train time. Instead, it builds the final-step KKT
-        ingredients of an OD-free convex transshipment surrogate using only:
-          - node net demand D,
-          - separable edge cost c(f),
-          - node potential phi.
-        The goal is to provide a transparent "cost-driven + conservation"
-        physics prior without introducing OD/path supervision.
-        """
-        rc_bpr_alpha = float(getattr(cfg.model, 'rc_bpr_alpha', 0.15))
-        rc_bpr_beta = float(getattr(cfg.model, 'rc_bpr_beta', 4.0))
-        flow_softplus_scale = max(
-            float(getattr(cfg.model, 'flow_softplus_scale', 5.0)),
-            1e-6,
-        )
-
-        f_real_final = f_scaled_final * self.flow_std + self.flow_mean
-        # Keep both quantities in real flow units:
-        #   - f_cost_pos: smooth positive proxy for cost evaluation
-        #   - f_active  : activity weight for complementarity only
-        f_cost_pos_final = flow_softplus_scale * F.softplus(
-            f_real_final / flow_softplus_scale
-        )
-        f_active_final = torch.relu(f_real_final)
-        if not torch.isfinite(f_real_final).all():
-            raise RuntimeError("Final real-space flow contains NaN/Inf values.")
-        if not torch.isfinite(f_cost_pos_final).all():
-            raise RuntimeError("Final smooth positive flow for the reduced-cost cost branch contains NaN/Inf values.")
-        if not torch.isfinite(f_active_final).all():
-            raise RuntimeError("Final active-flow weight for the reduced-cost branch contains NaN/Inf values.")
-
-        batch.f_real_final = f_real_final
-        batch.f_cost_pos_final = f_cost_pos_final
-        batch.f_active_final = f_active_final
-
-        if self.node_potential_head is None:
-            batch.phi_v_final = None
-            batch.edge_cost_final = None
-            batch.reduced_cost_final = None
-            return
-
-        phi_v_final = self.node_potential_head(h_v_final)
-        if not torch.isfinite(phi_v_final).all():
-            raise RuntimeError("Node-potential head produced NaN/Inf values in phi_v_final.")
-
-        capacity_new_real = torch.clamp(
-            batch.capacity_new_real.to(device=f_cost_pos_final.device, dtype=f_cost_pos_final.dtype),
-            min=1e-6,
-        )
-        free_flow_time_new_real = torch.clamp(
-            batch.free_flow_time_new_real.to(
-                device=f_cost_pos_final.device,
-                dtype=f_cost_pos_final.dtype,
-            ),
-            min=1e-6,
-        )
-        flow_capacity_ratio = torch.clamp(f_cost_pos_final / capacity_new_real, min=0.0, max=1.0e6)
-        edge_cost_final = free_flow_time_new_real * (
-            1.0 + rc_bpr_alpha * torch.pow(flow_capacity_ratio, rc_bpr_beta)
-        )
-        if not torch.isfinite(edge_cost_final).all():
-            raise RuntimeError("BPR edge cost produced NaN/Inf values in edge_cost_final.")
-
-        src = batch.edge_index_new[0]
-        dst = batch.edge_index_new[1]
-        reduced_cost_final = edge_cost_final + phi_v_final[dst] - phi_v_final[src]
-        if not torch.isfinite(reduced_cost_final).all():
-            raise RuntimeError("Reduced-cost surrogate produced NaN/Inf values in reduced_cost_final.")
-
-        batch.phi_v_final = phi_v_final
-        batch.edge_cost_final = edge_cost_final
-        batch.reduced_cost_final = reduced_cost_final
-
-    # ================================================================
-    # Forward Pass
-    # ================================================================
-
     def forward(self, batch):
-        r"""
-        Self-driven pseudo-spatiotemporal diffusion forward pass.
-
-        Pipeline:
-          Phase 2 — Initial State Projection (k=0):
-            f_scaled_0  : [E_new, 1]   old flows projected onto new topology
-            rho_v_0     : [N, 1]       initial pressure shockwave (real space)
-
-          Phase 3 — Pseudo-Time Diffusion Loop (k=1..K):
-            for each step k:
-              DiffusionCell  → Δf_scaled^(k)              [E_new, 1]
-              Flow update    → f_scaled^(k)               [E_new, 1]
-              LWR update     → ρ_v^(k)                    [N, 1]
-
-          Output: f_scaled^(K) as final predicted flows (normalized space)
-
-        Physics state is attached to ``batch`` for Phase 4 loss computation:
-          batch.rho_v_final   : [N, 1]          terminal pressure (should → 0)
-          batch.rho_v_history : list of [N, 1]  pressure at every step
-
-        Args:
-            batch : PyG Batch object
-
-        Returns:
-            pred : [E_new_total, 1]  predicted equilibrium flows (normalized)
-            true : [E_new_total, 1]  ground truth flows (normalized)
-        """
-        total_nodes: int = batch.num_nodes
+        total_nodes = int(batch.num_nodes)
         device = batch.edge_attr_new.device
         dtype = batch.edge_attr_new.dtype
-        if self.enable_node_potential_head:
-            self._attach_real_new_edge_attrs(batch)
 
-        # ══════════════════════════════════════════════════════════════════
-        # Phase 2: Initial State Projection (k=0)
-        # ══════════════════════════════════════════════════════════════════
-        f_scaled_0 = self._project_initial_flow(batch)                # [E_new, 1]
-        rho_v_0 = self._compute_initial_pressure(f_scaled_0, batch)   # [N, 1]
+        f_scaled_0 = self._project_initial_flow(batch)
+        rho_v_0 = self._compute_initial_pressure(f_scaled_0, batch)
         batch.f_init_scaled = f_scaled_0
         batch.f_init_real = f_scaled_0 * self.flow_std + self.flow_mean
 
-        # ══════════════════════════════════════════════════════════════════
-        # Phase 3: Initialize Latent Hidden States
-        # ══════════════════════════════════════════════════════════════════
-
-        # Edge hidden state h_e^(0): encode static edge context
-        # aligned_features captures [old_attrs, old_flow, new_attrs, is_new_edge]
         aligned_features = self.aligner(
             edge_index_old=batch.edge_index_old,
             edge_attr_old=batch.edge_attr_old,
@@ -1179,29 +785,25 @@ class NetworkPairsTopologyModel(nn.Module):
             edge_index_new=batch.edge_index_new,
             edge_attr_new=batch.edge_attr_new,
             total_nodes=total_nodes,
-        )                                                              # [E_new, 8]
-        h_e = self.edge_init_proj(aligned_features)                    # [E_new, H]
+        )
+        h_e = self.edge_init_proj(aligned_features)
+        h_v = torch.ones(total_nodes, self.hidden_dim, device=device, dtype=dtype)
 
-        # Node hidden state h_v^(0): blank slate (ones)
-        h_v = torch.ones(total_nodes, self.hidden_dim,
-                         device=device, dtype=dtype)                   # [N, H]
+        f_scaled_k = f_scaled_0
+        rho_v_k = rho_v_0
+        rho_v_history = [rho_v_0]
+        delta_f_scaled_history = []
 
-        # ══════════════════════════════════════════════════════════════════
-        # Phase 3: Pseudo-Time Diffusion Loop (k = 1 … K)
-        # ══════════════════════════════════════════════════════════════════
-        f_scaled_k = f_scaled_0       # [E_new, 1]
-        rho_v_k    = rho_v_0          # [N, 1]
-        rho_v_history = [rho_v_0]     # track pressure at every step
+        src = batch.edge_index_new[0]
+        dst = batch.edge_index_new[1]
 
-        src = batch.edge_index_new[0]  # [E_new]  (cache for LWR updates)
-        dst = batch.edge_index_new[1]  # [E_new]
+        for step in range(self.K):
+            rho_v_input = rho_v_0 if self.pressure_update_mode == "fixed_initial" else rho_v_k
+            rho_v_scaled = rho_v_input / self.flow_std
+            apply_global_attn = self.enable_global_attn and (((step + 1) % self.attention_every_k_steps) == 0)
+            cell = self.diffusion_cell if self.share_diffusion_cell else self.diffusion_cells[step]
 
-        for _k in range(self.K):
-            rho_v_scaled = rho_v_k / self.flow_std
-            apply_global_attn = ((_k + 1) % self.attention_every_k_steps == 0)
-
-            # ── Neural Darcy's Law: observe (ρ, f) → predict Δf ──────────
-            h_v, h_e, delta_f_scaled = self.diffusion_cell(
+            h_v, h_e, delta_f_scaled = cell(
                 h_v=h_v,
                 h_e=h_e,
                 rho_v=rho_v_scaled,
@@ -1210,62 +812,44 @@ class NetworkPairsTopologyModel(nn.Module):
                 batch_vec=batch.batch,
                 apply_global_attn=apply_global_attn,
             )
-            # h_v         : [N, H]       updated node hidden
-            # h_e         : [E_new, H]   updated edge hidden
-            # delta_f_scaled : [E_new, 1]   predicted flow change
 
-            # ── Update edge flow (normalized space) ──────────────────────
-            f_scaled_k = f_scaled_k + delta_f_scaled                   # [E_new, 1]
+            f_scaled_k = f_scaled_k + delta_f_scaled
+            if self.log_variance_stats:
+                delta_f_scaled_history.append(delta_f_scaled.detach())
 
-            # ── Convert Δf to real space ─────────────────────────────────
-            # CRITICAL: multiply by σ ONLY. Do NOT add μ!
-            # Δf_real = Δf_scaled × σ  (the mean cancels in the delta)
-            delta_f_real_flat = (delta_f_scaled * self.flow_std).squeeze(-1)  # [E_new]
-
-            # ── Corrected Discrete LWR: update node pressure ─────────────
-            # ρ_v^(k) = ρ_v^(k-1) + (Σ Δf_in_real - Σ Δf_out_real)
-            delta_in = torch.zeros(total_nodes, device=device, dtype=dtype)
-            delta_out = torch.zeros(total_nodes, device=device, dtype=dtype)
-            delta_in.scatter_add_(0, dst, delta_f_real_flat)
-            delta_out.scatter_add_(0, src, delta_f_real_flat)
-
-            rho_v_k = rho_v_k + (delta_in - delta_out).unsqueeze(-1)  # [N, 1]
+            if self.pressure_update_mode == "lwr":
+                delta_f_real_flat = (delta_f_scaled * self.flow_std).squeeze(-1)
+                delta_in = torch.zeros(total_nodes, device=device, dtype=dtype)
+                delta_out = torch.zeros(total_nodes, device=device, dtype=dtype)
+                delta_in.scatter_add_(0, dst, delta_f_real_flat)
+                delta_out.scatter_add_(0, src, delta_f_real_flat)
+                rho_v_k = rho_v_k + (delta_in - delta_out).unsqueeze(-1)
+            else:
+                rho_v_k = rho_v_0
             rho_v_history.append(rho_v_k)
 
-        # ══════════════════════════════════════════════════════════════════
-        # Attach physics state to batch for Phase 4 loss computation
-        # ══════════════════════════════════════════════════════════════════
-        # Keep the raw diffused flow state for debugging / future trajectory
-        # work. The main prediction remains the terminal diffused flow, while
-        # the residual head stays auxiliary-only.
         batch.f_diffused_scaled_final = f_scaled_k
+        batch.f_diffused_real_final = f_scaled_k * self.flow_std + self.flow_mean
         batch.rho_v_diffused_final = rho_v_k
-
-        batch.h_v_final = h_v
-        batch.h_e_final = h_e
-        if self.rerouting_residual_head is None:
-            batch.reroute_residual_pred_scaled = None
-        else:
-            batch.reroute_residual_pred_scaled = self.rerouting_residual_head(h_e)
-
         batch.rho_v_final = rho_v_k
-        rho_v_history[-1] = rho_v_k
         batch.rho_v_history = rho_v_history
-
-        self._attach_reduced_cost_state(
-            batch=batch,
-            f_scaled_final=f_scaled_k,
-            h_v_final=h_v,
-        )
-
-        # Expose final diffusion states and reduced-cost tensors while keeping
-        # the main model output unchanged.
         batch.h_v_final = h_v
         batch.h_e_final = h_e
-        self._attach_reduced_cost_state(
-            batch=batch,
-            f_scaled_final=f_scaled_k,
-            h_v_final=h_v,
-        )
+        if self.log_variance_stats:
+            if delta_f_scaled_history:
+                delta_stack = torch.stack([_safe_std(delta) for delta in delta_f_scaled_history])
+                delta_abs_stack = torch.stack(
+                    [delta.detach().float().abs().mean() for delta in delta_f_scaled_history]
+                )
+                batch.delta_f_scaled_std = delta_stack.mean()
+                batch.delta_f_scaled_abs_mean = delta_abs_stack.mean()
+            else:
+                batch.delta_f_scaled_std = f_scaled_k.new_zeros(())
+                batch.delta_f_scaled_abs_mean = f_scaled_k.new_zeros(())
+            batch.h_e_std = _safe_std(h_e)
+            batch.h_v_std = _safe_std(h_v)
+            batch.f_scaled_std = _safe_std(f_scaled_k)
+            batch.rho_v_std = _safe_std(rho_v_k)
+            batch.rho_v_abs_mean = rho_v_k.detach().float().abs().mean()
 
         return f_scaled_k, batch.y

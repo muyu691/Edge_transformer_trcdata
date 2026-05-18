@@ -1,5 +1,5 @@
 out_dir: results
-metric_best: mae
+metric_best: rmse_norm
 metric_agg: argmin
 name_tag: network-pairs-topology-pinn
 
@@ -17,7 +17,7 @@ dataset:
   network_file: ''
   od_file: ''
   parser: tntp
-  processed_root: create_sioux_data/processed_data/pyg_dataset
+  processed_root: create_sioux_data/processed_data
   node_id_offset: 1
   centroid_nodes: ''
   demand_source: lhs
@@ -29,19 +29,13 @@ dataset:
   task: graph
   task_type: regression
   transductive: False
-  dir: create_sioux_data/processed_data/pyg_dataset
+  dir: create_sioux_data/processed_data
   flow_mean: 0.0
   flow_std: 1.0
   node_encoder: False
   edge_encoder: False
-  use_virtual_links: True
   mask_capacity: False
   mask_fft: False
-
-posenc_LapPE:
-  enable: False
-posenc_RWSE:
-  enable: False
 
 train:
   mode: custom
@@ -50,64 +44,57 @@ train:
   ckpt_period: 50
   enable_ckpt: True
   auto_resume: False
+  log_variance_stats: False
 
 model:
   type: topology_gnn
   loss_fun: l1
-  lambda_eq: 1.0
   lambda_old: 1.0
   lambda_new_start: 1.0
   lambda_new_final: 1.0
   lambda_new_warmup_epochs: 50
   lambda_new_schedule: linear
-<<<<<<< HEAD
-  # Separate residual head for Delta-f = f_new - f_init, kept distinct from the main final-flow output.
-  enable_rerouting_residual_head: True
-  # Auxiliary supervision weight on the dedicated rerouting residual head.
-  lambda_reroute_residual: 0.5
-  # Mainline experiment disables the OD-free reduced-cost branch.
-  enable_node_potential_head: False
-  # Set to 0 to remove reduced-cost regularization from the main training objective.
-  lambda_rc: 0.0
-=======
-  # Enable the node-potential head used by the OD-free reduced-cost surrogate.
-  enable_node_potential_head: True
-  # Final outer weight on the OD-free reduced-cost surrogate after warmup.
-  lambda_rc: 0.05
->>>>>>> 058655b286e2606488e7fb1e8072052dd458d355
-  # Warm up lambda_rc linearly so flow fitting stabilizes before RC regularization dominates.
-  lambda_rc_warmup_epochs: 40
-  # Weight on reduced-cost nonnegativity: ReLU(-r_e)^2.
-  lambda_rc_nonneg: 1.0
-  # Weight on complementarity: f_active * ReLU(r_e)^2.
-  lambda_rc_comp: 1.0
-  # Weak gauge fix on node potentials: mean(phi)^2.
-  lambda_rc_gauge: 0.1
-  # Smooth positive flow scale used only in f_cost_pos for the BPR cost branch.
-  flow_softplus_scale: 5.0
-  # BPR alpha in c_e(f)=t0*(1 + alpha*(f/cap)^beta).
-  rc_bpr_alpha: 0.15
-  # BPR beta in c_e(f)=t0*(1 + alpha*(f/cap)^beta).
-  rc_bpr_beta: 4.0
+  # Three-stage conservation schedule:
+  # 0-50 epochs: lambda_con = 0, learn the supervised flow mapping first.
+  # 50-120 epochs: linearly ramp to lambda_con_mid.
+  # 120-200 epochs: linearly ramp to lambda_con for feasibility fine-tuning.
+  lambda_con: 0.05
+  lambda_con_schedule: staged_linear
+  lambda_con_zero_epochs: 50
+  lambda_con_mid: 0.01
+  lambda_con_mid_epoch: 120
+  lambda_con_final_epoch: 200
+  lambda_con_warmup_epochs: 50
   graph_pooling: none
-
-gt:
-  layer_norm: True  
-  batch_norm: False
 
 gnn:
   batchnorm: False
 
 topology_gnn:
   hidden_dim: 128
-  num_layers_old: 3
-  num_layers_new: 3
   num_diffusion_steps: 4
-  # Apply global attention every K pseudo-time steps; 1 recovers the original per-step attention.
   attention_every_k_steps: 2
   dropout: 0.1
   residual: True
   num_heads: 4
+  local_backbone: edge_transformer
+  num_edge_transformer_layers: 1
+  ffn_type: swiglu
+  ffn_mult: "8/3"
+  norm_type: rmsnorm
+  norm_position: pre
+  edge_to_node_agg: mean
+  edge_endpoint_mode: fusion
+  enable_global_attn: False
+  init_scheme: default
+  init_residual_scale: 0.1
+  init_delta_scale: 0.1
+  inject_rho_to_edges: True
+  inject_flow_to_edges: True
+  inject_rho_to_nodes: True
+  pressure_update_mode: lwr
+  share_diffusion_cell: True
+  alignment_mode: full
 
 optim:
   clip_grad_norm: True
@@ -116,9 +103,12 @@ optim:
   weight_decay: 1.0e-5
   base_lr: 0.001
   max_epoch: 200
-  scheduler: cosine_with_warmup
+  scheduler: wsd
   num_warmup_epochs: 10
   min_lr: 1.0e-6
+  wsd_stable_epochs: 140
+  wsd_decay_epochs: 50
+  wsd_decay_type: cosine
   reduce_factor: 0.5
   schedule_patience: 20
   batch_accumulation: 1

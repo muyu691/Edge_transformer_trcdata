@@ -1,57 +1,39 @@
-"""
-Phase 2 config: NetworkPairsTopologyModel hyperparameter registration
-
-All parameters are mounted under the cfg.topology_gnn namespace,
-and can be overridden via YAML config file or command line.
-"""
+"""Config registration for the active ST-PINN topology model."""
 
 from torch_geometric.graphgym.register import register_config
 from yacs.config import CfgNode as CN
 
-@register_config('topology_gnn')
-def topology_gnn_cfg(cfg):
-    """
-    Register dedicated config group for NetworkPairsTopologyModel.
 
-    Example YAML config snippet:
-      topology_gnn:
-        hidden_dim: 128
-        num_layers_old: 3
-        num_layers_new: 3
-        dropout: 0.1
-        residual: true
-    """
+@register_config("topology_gnn")
+def topology_gnn_cfg(cfg):
     cfg.topology_gnn = CN()
 
-    # Unified hidden dimension for all GNN layers (OldGraphEncoder + NewGraphReasoner)
-    # Node and edge embeddings are within this space
     cfg.topology_gnn.hidden_dim = 128
-
-    # Number of stacked GatedGCN layers in OldGraphEncoder
-    cfg.topology_gnn.num_layers_old = 3
-
-    # Number of stacked GatedGCN layers in NewGraphReasoner
-    cfg.topology_gnn.num_layers_new = 3
-
-    # Dropout probability, applied within GatedGCN layers and node_fusion / edge_decoder
     cfg.topology_gnn.dropout = 0.1
-
-    # Whether to use residual connections in GatedGCN layers
-    # Note: This residual refers to the skip connection within GatedGCN layers themselves,
-    #       and is unrelated to the prohibition of residuals in the node_fusion layer of NewGraphReasoner
     cfg.topology_gnn.residual = True
 
-    # Number of attention heads in ImplicitVirtualRoutingLayer
-    # Controls the granularity of implicit demand virtual links:
-    #   more heads → model can capture more diverse OD/rerouting patterns in parallel
-    # Must satisfy: hidden_dim % num_heads == 0
     cfg.topology_gnn.num_heads = 4
-
-    # Number of pseudo-time diffusion steps K (Phase 3).
-    # Each step applies Neural Darcy's Law: observe pressure → predict Δf → update ρ.
-    # More steps → finer-grained equilibrium convergence, but more compute.
     cfg.topology_gnn.num_diffusion_steps = 4
-
-    # Execute global self-attention only every K pseudo-time steps.
-    # Default 1 preserves the original behavior of running attention at each step.
     cfg.topology_gnn.attention_every_k_steps = 1
+    cfg.topology_gnn.enable_global_attn = True
+
+    cfg.topology_gnn.inject_rho_to_edges = True
+    cfg.topology_gnn.inject_flow_to_edges = True
+    cfg.topology_gnn.inject_rho_to_nodes = True
+    cfg.topology_gnn.initial_flow_mode = "old_flow_warm_start"
+    cfg.topology_gnn.initial_pressure_mode = "from_initial_flow"
+    cfg.topology_gnn.pressure_update_mode = "lwr"
+    cfg.topology_gnn.share_diffusion_cell = True
+    cfg.topology_gnn.alignment_mode = "full"
+
+    cfg.topology_gnn.local_backbone = "gatedgcn"
+    cfg.topology_gnn.num_edge_transformer_layers = 1
+    cfg.topology_gnn.ffn_type = "relu"
+    cfg.topology_gnn.ffn_mult = "4"
+    cfg.topology_gnn.norm_type = "layernorm"
+    cfg.topology_gnn.norm_position = "post"
+    cfg.topology_gnn.edge_to_node_agg = "mean"
+    cfg.topology_gnn.edge_endpoint_mode = "fusion"
+    cfg.topology_gnn.init_scheme = "default"
+    cfg.topology_gnn.init_residual_scale = 0.1
+    cfg.topology_gnn.init_delta_scale = 0.1

@@ -1,0 +1,103 @@
+out_dir: results
+metric_best: rmse_norm
+metric_agg: argmin
+name_tag: edge-transformer-shared-endpoint-bias
+
+wandb:
+  use: False
+  project: network-pairs-topology
+  entity: your-wandb-entity
+
+dataset:
+  format: PyG-NetworkPairs
+  name: network-pairs-topology
+  dataset_name: traffic-network-pairs
+  network_name: SiouxFalls
+  dataset_root: sioux_data
+  network_file: ''
+  od_file: ''
+  parser: tntp
+  processed_root: create_sioux_data/processed_data
+  node_id_offset: 1
+  centroid_nodes: ''
+  demand_source: lhs
+  num_nodes: 0
+  num_edges_old: 0
+  num_edges_new: 0
+  od_dim: 0
+  centroid_count: 0
+  task: graph
+  task_type: regression
+  transductive: False
+  dir: create_sioux_data/processed_data
+  flow_mean: 0.0
+  flow_std: 1.0
+  node_encoder: False
+  edge_encoder: False
+  mask_capacity: False
+  mask_fft: False
+
+train:
+  mode: custom
+  batch_size: 32
+  eval_period: 1
+  ckpt_period: 50
+  enable_ckpt: True
+  auto_resume: False
+
+model:
+  type: topology_gnn
+  loss_fun: l1
+  lambda_old: 1.0
+  lambda_new_start: 1.0
+  lambda_new_final: 1.0
+  lambda_new_warmup_epochs: 50
+  lambda_new_schedule: linear
+  lambda_con: 0.05
+  lambda_con_schedule: staged_linear
+  lambda_con_zero_epochs: 50
+  lambda_con_mid: 0.01
+  lambda_con_mid_epoch: 120
+  lambda_con_final_epoch: 200
+  lambda_con_warmup_epochs: 50
+  graph_pooling: none
+
+gnn:
+  batchnorm: False
+
+topology_gnn:
+  hidden_dim: 128
+  num_diffusion_steps: 4
+  attention_every_k_steps: 2
+  dropout: 0.1
+  residual: True
+  num_heads: 4
+  local_backbone: edge_transformer
+  num_edge_transformer_layers: 1
+  ffn_type: swiglu
+  ffn_mult: "8/3"
+  norm_type: rmsnorm
+  norm_position: pre
+  edge_to_node_agg: mean
+  edge_endpoint_mode: shared_endpoint_bias
+  enable_global_attn: True
+  inject_rho_to_edges: True
+  inject_flow_to_edges: True
+  inject_rho_to_nodes: True
+  pressure_update_mode: lwr
+  share_diffusion_cell: True
+  alignment_mode: full
+
+optim:
+  clip_grad_norm: True
+  clip_grad_norm_value: 1.0
+  optimizer: adamW
+  weight_decay: 1.0e-5
+  base_lr: 0.001
+  max_epoch: 200
+  scheduler: cosine_with_warmup
+  num_warmup_epochs: 10
+  min_lr: 1.0e-6
+  reduce_factor: 0.5
+  schedule_patience: 20
+  batch_accumulation: 1

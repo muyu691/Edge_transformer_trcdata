@@ -31,6 +31,9 @@ class ExtendedSchedulerConfig(SchedulerConfig):
     schedule_patience: int = 15
     min_lr: float = 1e-6
     num_warmup_epochs: int = 10
+    wsd_stable_epochs: int = 0
+    wsd_decay_epochs: int = 50
+    wsd_decay_type: str = "cosine"
     train_mode: str = 'custom'
     eval_period: int = 1
 
@@ -111,6 +114,47 @@ def cosine_with_warmup_scheduler(optimizer: Optimizer,
     return scheduler
 
 
+@register.register_scheduler('wsd')
+def warmup_stable_decay_scheduler(
+        optimizer: Optimizer,
+        num_warmup_epochs: int,
+        max_epoch: int,
+        min_lr: float,
+        wsd_stable_epochs: int,
+        wsd_decay_epochs: int,
+        wsd_decay_type: str):
+    scheduler = get_wsd_schedule_with_warmup(
+        optimizer=optimizer,
+        num_warmup_steps=num_warmup_epochs,
+        num_training_steps=max_epoch,
+        min_lr=min_lr,
+        stable_steps=wsd_stable_epochs,
+        decay_steps=wsd_decay_epochs,
+        decay_type=wsd_decay_type,
+    )
+    return scheduler
+
+
+@register.register_scheduler('warmup_stable_decay')
+def warmup_stable_decay_scheduler_alias(
+        optimizer: Optimizer,
+        num_warmup_epochs: int,
+        max_epoch: int,
+        min_lr: float,
+        wsd_stable_epochs: int,
+        wsd_decay_epochs: int,
+        wsd_decay_type: str):
+    return warmup_stable_decay_scheduler(
+        optimizer=optimizer,
+        num_warmup_epochs=num_warmup_epochs,
+        max_epoch=max_epoch,
+        min_lr=min_lr,
+        wsd_stable_epochs=wsd_stable_epochs,
+        wsd_decay_epochs=wsd_decay_epochs,
+        wsd_decay_type=wsd_decay_type,
+    )
+
+
 @register.register_scheduler('polynomial_with_warmup')
 def polynomial_with_warmup_scheduler(optimizer: Optimizer,
                                  num_warmup_epochs: int, max_epoch: int):
@@ -189,6 +233,70 @@ def get_cosine_schedule_with_warmup(
         return max(0.0, 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress)))
 
     return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda, last_epoch)
+
+
+def get_wsd_schedule_with_warmup(
+        optimizer: Optimizer,
+        num_warmup_steps: int,
+        num_training_steps: int,
+        min_lr: float,
+        stable_steps: int = 0,
+        decay_steps: int = 50,
+        decay_type: str = "cosine",
+        last_epoch: int = -1):
+    """
+    Warmup-Stable-Decay schedule.
+
+    Phase 1 warms up linearly to each param group's initial LR, phase 2 keeps
+    it stable, and phase 3 decays it to cfg.optim.min_lr.
+    """
+    num_training_steps = max(int(num_training_steps), 1)
+    warmup_steps = min(max(int(num_warmup_steps), 0), num_training_steps)
+    decay_steps = max(int(decay_steps), 0)
+    stable_steps = max(int(stable_steps), 0)
+
+    if stable_steps == 0:
+        if decay_steps == 0:
+            decay_steps = max(num_training_steps - warmup_steps, 1)
+        stable_steps = max(num_training_steps - warmup_steps - decay_steps, 0)
+    elif decay_steps == 0:
+        decay_steps = max(num_training_steps - warmup_steps - stable_steps, 1)
+
+    if warmup_steps + stable_steps + decay_steps > num_training_steps:
+        stable_steps = max(num_training_steps - warmup_steps - decay_steps, 0)
+    if warmup_steps + stable_steps + decay_steps > num_training_steps:
+        decay_steps = max(num_training_steps - warmup_steps - stable_steps, 1)
+
+    stable_end = warmup_steps + stable_steps
+    decay_end = stable_end + decay_steps
+    decay_type = str(decay_type).lower()
+    if decay_type not in ("cosine", "linear"):
+        raise ValueError("wsd_decay_type must be one of: 'cosine', 'linear'")
+
+    def _make_lr_lambda(base_lr: float):
+        min_ratio = float(min_lr) / max(float(base_lr), 1e-12)
+        min_ratio = min(max(min_ratio, 0.0), 1.0)
+
+        def lr_lambda(current_step: int):
+            if warmup_steps > 0 and current_step < warmup_steps:
+                return max(min_ratio, float(current_step) / float(max(1, warmup_steps)))
+            if current_step < stable_end:
+                return 1.0
+            if current_step >= decay_end:
+                return min_ratio
+
+            progress = float(current_step - stable_end) / float(max(1, decay_steps))
+            progress = min(max(progress, 0.0), 1.0)
+            if decay_type == "linear":
+                decay_multiplier = 1.0 - progress
+            else:
+                decay_multiplier = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return min_ratio + (1.0 - min_ratio) * decay_multiplier
+
+        return lr_lambda
+
+    lr_lambdas = [_make_lr_lambda(group["lr"]) for group in optimizer.param_groups]
+    return optim.lr_scheduler.LambdaLR(optimizer, lr_lambdas, last_epoch)
 
 
 def get_polynomial_decay_schedule_with_warmup(

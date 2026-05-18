@@ -41,7 +41,7 @@ class NetworkPairsTopologyDataset(InMemoryDataset):
             raise FileNotFoundError(
                 f"Missing processed split file: {pt_path}\n"
                 f"Run the data pipeline first:\n"
-                f"  1. python solve_network_pairs.py --network_name <SiouxFalls|EMA|Anaheim>\n"
+                f"  1. python solve_network_pairs.py --network_name <NetworkName>\n"
                 f"  2. python build_network_pairs_dataset.py --output_dir {self.root}\n"
             )
 
@@ -68,7 +68,7 @@ class NetworkPairsTopologyDataset(InMemoryDataset):
         raise FileNotFoundError(
             "NetworkPairs datasets are not downloaded automatically.\n"
             "Generate them locally first:\n"
-            "  1. python solve_network_pairs.py --network_name <SiouxFalls|EMA|Anaheim>\n"
+            "  1. python solve_network_pairs.py --network_name <NetworkName>\n"
             f"  2. python build_network_pairs_dataset.py --output_dir {self.root}\n"
         )
 

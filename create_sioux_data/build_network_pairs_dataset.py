@@ -25,51 +25,23 @@ from torch_geometric.data import Data
 from tqdm import tqdm
 
 
-DEFAULT_SIOUX_NODE_IDS = tuple(range(1, 25))
-DEFAULT_SIOUX_CENTROIDS = tuple(range(1, 12))
-
-
 def extract_edge_attrs(G, edge_list: list) -> np.ndarray:
     """Extract [capacity, speed, length] in the canonical edge order."""
-    caps = np.array([G[u][v]['capacity'] for u, v in edge_list], dtype=np.float64)
-    speeds = np.array([G[u][v]['speed'] for u, v in edge_list], dtype=np.float64)
-    lengths = np.array([G[u][v]['length'] for u, v in edge_list], dtype=np.float64)
-    return np.column_stack([caps, speeds, lengths])
+    capacities = np.array([G[u][v]["capacity"] for u, v in edge_list], dtype=np.float64)
+    speeds = np.array([G[u][v]["speed"] for u, v in edge_list], dtype=np.float64)
+    lengths = np.array([G[u][v]["length"] for u, v in edge_list], dtype=np.float64)
+    return np.column_stack([capacities, speeds, lengths])
 
 
-def infer_node_ids(pair: dict) -> tuple[int, ...]:
-    """Infer canonical node ordering for one pair."""
-    if pair.get('node_ids'):
-        return tuple(int(node_id) for node_id in pair['node_ids'])
-    if pair.get('G') is not None:
-        return tuple(sorted(pair['G'].nodes()))
-    if pair.get('G_prime') is not None:
-        return tuple(sorted(pair['G_prime'].nodes()))
-    raise ValueError("Cannot infer node ids from pair metadata.")
-
-
-def infer_centroid_nodes(pair: dict, node_ids: tuple[int, ...]) -> tuple[int, ...]:
-    """Infer centroid nodes from metadata with a Sioux fallback for old pickles."""
-    if pair.get('centroid_nodes'):
-        return tuple(int(node_id) for node_id in pair['centroid_nodes'])
-
-    od_matrix = pair.get('od_matrix')
-    if isinstance(od_matrix, np.ndarray) and od_matrix.ndim == 2:
-        return tuple(node_ids[: int(od_matrix.shape[0])])
-
-    if node_ids == DEFAULT_SIOUX_NODE_IDS:
-        return DEFAULT_SIOUX_CENTROIDS
-
-    return tuple()
-
-
-def infer_network_name(pair: dict, node_ids: tuple[int, ...]) -> str:
-    """Infer network name while keeping backward compatibility."""
-    if pair.get('network_name'):
-        return str(pair['network_name'])
-    if node_ids == DEFAULT_SIOUX_NODE_IDS:
-        return 'SiouxFalls'
-    return 'Unknown'
+def _require_pair_metadata(pair: dict, key: str):
+    value = pair.get(key)
+    if value in (None, "", ()):
+        raise ValueError(
+            f"Missing pair['{key}'] in the raw dataset. "
+            "This builder only supports the new network_pairs_dataset.pkl generated "
+            "by the current solve_network_pairs.py pipeline."
+        )
+    return value
 
 
 def edge_list_to_index(edge_list: list, node_id_to_index: dict[int, int]) -> np.ndarray:
@@ -94,10 +66,10 @@ def fit_scalers(pairs: list, train_idx: np.ndarray) -> tuple[StandardScaler, Sta
 
     for idx in train_idx:
         pair = pairs[int(idx)]
-        all_attrs.append(extract_edge_attrs(pair['G'], pair['edge_list_old']))
-        all_attrs.append(extract_edge_attrs(pair['G_prime'], pair['edge_list_new']))
-        all_flows.append(pair['flows_old'].reshape(-1, 1))
-        all_flows.append(pair['flows_new'].reshape(-1, 1))
+        all_attrs.append(extract_edge_attrs(pair["G"], pair["edge_list_old"]))
+        all_attrs.append(extract_edge_attrs(pair["G_prime"], pair["edge_list_new"]))
+        all_flows.append(pair["flows_old"].reshape(-1, 1))
+        all_flows.append(pair["flows_new"].reshape(-1, 1))
 
     all_attrs_np = np.vstack(all_attrs)
     all_flows_np = np.vstack(all_flows)
@@ -105,11 +77,8 @@ def fit_scalers(pairs: list, train_idx: np.ndarray) -> tuple[StandardScaler, Sta
     print(f"  Training edge attribute matrix shape: {all_attrs_np.shape}")
     print(f"  Training flow matrix shape:          {all_flows_np.shape}")
 
-    attr_scaler = StandardScaler()
-    attr_scaler.fit(all_attrs_np)
-
-    flow_scaler = StandardScaler()
-    flow_scaler.fit(all_flows_np)
+    attr_scaler = StandardScaler().fit(all_attrs_np)
+    flow_scaler = StandardScaler().fit(all_flows_np)
 
     print(f"  attr_scaler mean: {attr_scaler.mean_}")
     print(f"  attr_scaler std:  {attr_scaler.scale_}")
@@ -119,53 +88,40 @@ def fit_scalers(pairs: list, train_idx: np.ndarray) -> tuple[StandardScaler, Sta
     return attr_scaler, flow_scaler
 
 
-def save_scalers(
-    attr_scaler: StandardScaler,
-    flow_scaler: StandardScaler,
-    output_dir: str,
-) -> None:
+def save_scalers(attr_scaler: StandardScaler, flow_scaler: StandardScaler, output_dir: str) -> None:
     """Persist fitted scalers."""
-    scalers_dir = os.path.join(output_dir, 'scalers')
+    scalers_dir = os.path.join(output_dir, "scalers")
     os.makedirs(scalers_dir, exist_ok=True)
 
-    with open(os.path.join(scalers_dir, 'attr_scaler.pkl'), 'wb') as f:
-        pickle.dump(attr_scaler, f)
-    with open(os.path.join(scalers_dir, 'flow_scaler.pkl'), 'wb') as f:
-        pickle.dump(flow_scaler, f)
+    with open(os.path.join(scalers_dir, "attr_scaler.pkl"), "wb") as handle:
+        pickle.dump(attr_scaler, handle)
+    with open(os.path.join(scalers_dir, "flow_scaler.pkl"), "wb") as handle:
+        pickle.dump(flow_scaler, handle)
 
     print(f"  Scaler saved to: {scalers_dir}/")
 
 
-def build_single_data_object(
-    pair: dict,
-    attr_scaler: StandardScaler,
-    flow_scaler: StandardScaler,
-) -> Data:
+def build_single_data_object(pair: dict, attr_scaler: StandardScaler, flow_scaler: StandardScaler) -> Data:
     """Convert one solved pair into a dynamic-size PyG Data object."""
-    node_ids = infer_node_ids(pair)
+    node_ids = tuple(int(node_id) for node_id in _require_pair_metadata(pair, "node_ids"))
+    centroid_nodes = tuple(int(node_id) for node_id in _require_pair_metadata(pair, "centroid_nodes"))
+    network_name = str(_require_pair_metadata(pair, "network_name"))
+
     num_nodes = len(node_ids)
     node_id_to_index = {node_id: idx for idx, node_id in enumerate(node_ids)}
-    centroid_nodes = infer_centroid_nodes(pair, node_ids)
     centroid_set = set(centroid_nodes)
-    network_name = infer_network_name(pair, node_ids)
-    od_dim = (
-        int(pair['od_matrix'].shape[0])
-        if isinstance(pair.get('od_matrix'), np.ndarray) and pair['od_matrix'].ndim == 2
-        else len(centroid_nodes)
-    )
+    od_dim = int(pair["od_matrix"].shape[0]) if isinstance(pair.get("od_matrix"), np.ndarray) else len(centroid_nodes)
 
-    raw_attr_old = extract_edge_attrs(pair['G'], pair['edge_list_old'])
-    raw_attr_new = extract_edge_attrs(pair['G_prime'], pair['edge_list_new'])
+    raw_attr_old = extract_edge_attrs(pair["G"], pair["edge_list_old"])
+    raw_attr_new = extract_edge_attrs(pair["G_prime"], pair["edge_list_new"])
     norm_attr_old = attr_scaler.transform(raw_attr_old).astype(np.float32)
     norm_attr_new = attr_scaler.transform(raw_attr_new).astype(np.float32)
-    speed_safe_new = np.clip(raw_attr_new[:, 1], a_min=1e-6, a_max=None)
-    free_flow_time_new = (raw_attr_new[:, 2] / speed_safe_new) * 60.0
 
-    norm_flow_old = flow_scaler.transform(pair['flows_old'].reshape(-1, 1)).astype(np.float32)
-    norm_flow_new = flow_scaler.transform(pair['flows_new'].reshape(-1, 1)).astype(np.float32)
+    norm_flow_old = flow_scaler.transform(pair["flows_old"].reshape(-1, 1)).astype(np.float32)
+    norm_flow_new = flow_scaler.transform(pair["flows_new"].reshape(-1, 1)).astype(np.float32)
 
-    edge_index_old = edge_list_to_index(pair['edge_list_old'], node_id_to_index)
-    edge_index_new = edge_list_to_index(pair['edge_list_new'], node_id_to_index)
+    edge_index_old = edge_list_to_index(pair["edge_list_old"], node_id_to_index)
+    edge_index_new = edge_list_to_index(pair["edge_list_new"], node_id_to_index)
 
     x = torch.ones((num_nodes, 1), dtype=torch.float32)
     non_centroid_mask = torch.tensor(
@@ -173,17 +129,17 @@ def build_single_data_object(
         dtype=torch.bool,
     )
 
-    src_old = np.array([node_id_to_index[u] for u, _ in pair['edge_list_old']], dtype=np.int64)
-    dst_old = np.array([node_id_to_index[v] for _, v in pair['edge_list_old']], dtype=np.int64)
-    flows_old_real = pair['flows_old'].reshape(-1).astype(np.float64)
+    src_old = np.array([node_id_to_index[u] for u, _ in pair["edge_list_old"]], dtype=np.int64)
+    dst_old = np.array([node_id_to_index[v] for _, v in pair["edge_list_old"]], dtype=np.int64)
+    flows_old_real = pair["flows_old"].reshape(-1).astype(np.float64)
     net_demand_np = np.zeros(num_nodes, dtype=np.float64)
     np.add.at(net_demand_np, dst_old, flows_old_real)
     np.add.at(net_demand_np, src_old, -flows_old_real)
     net_demand = torch.from_numpy(net_demand_np.astype(np.float32))
 
-    old_edge_set = set(tuple(edge) for edge in pair['edge_list_old'])
+    old_edge_set = set(tuple(edge) for edge in pair["edge_list_old"])
     new_edge_mask = torch.tensor(
-        [tuple(edge) not in old_edge_set for edge in pair['edge_list_new']],
+        [tuple(edge) not in old_edge_set for edge in pair["edge_list_new"]],
         dtype=torch.bool,
     )
 
@@ -194,23 +150,17 @@ def build_single_data_object(
         flow_old=torch.from_numpy(norm_flow_old),
         edge_index_new=torch.from_numpy(edge_index_new).long(),
         edge_attr_new=torch.from_numpy(norm_attr_new),
-        # Keep real new-graph edge attributes for the future OD-free
-        # reduced-cost surrogate. The normalized edge_attr_new path remains the
-        # main training input, while these raw tensors provide a stable physics
-        # route for capacity / speed / length / free-flow time.
-        edge_attr_new_real=torch.from_numpy(raw_attr_new.astype(np.float32)),
-        free_flow_time_new_real=torch.from_numpy(free_flow_time_new.astype(np.float32)).view(-1, 1),
         y=torch.from_numpy(norm_flow_new),
         non_centroid_mask=non_centroid_mask,
         net_demand=net_demand,
         new_edge_mask=new_edge_mask,
         node_ids=torch.tensor(node_ids, dtype=torch.long),
         num_nodes=num_nodes,
-        num_edges_old=len(pair['edge_list_old']),
-        num_edges_new=len(pair['edge_list_new']),
+        num_edges_old=len(pair["edge_list_old"]),
+        num_edges_new=len(pair["edge_list_new"]),
         centroid_count=len(centroid_nodes),
         od_dim=od_dim,
-        mutation_type=pair['mutation_type'],
+        mutation_type=pair["mutation_type"],
         network_name=network_name,
     )
 
@@ -232,13 +182,13 @@ def build_full_dataset(
         return dataset
 
     print(f"\n  Building training set ({len(train_idx)} samples)...")
-    train_dataset = _build_split(train_idx, 'Train')
+    train_dataset = _build_split(train_idx, "Train")
 
     print(f"\n  Building validation set ({len(val_idx)} samples)...")
-    val_dataset = _build_split(val_idx, 'Val')
+    val_dataset = _build_split(val_idx, "Val")
 
     print(f"\n  Building test set ({len(test_idx)} samples)...")
-    test_dataset = _build_split(test_idx, 'Test')
+    test_dataset = _build_split(test_idx, "Test")
 
     return train_dataset, val_dataset, test_dataset
 
@@ -266,8 +216,8 @@ def split_indices(
         n_val = max(0, num_samples - n_train)
 
     train_idx = all_idx[:n_train]
-    val_idx = all_idx[n_train:n_train + n_val]
-    test_idx = all_idx[n_train + n_val:]
+    val_idx = all_idx[n_train : n_train + n_val]
+    test_idx = all_idx[n_train + n_val :]
     return train_idx, val_idx, test_idx
 
 
@@ -280,10 +230,10 @@ def print_dataset_stats(train_dataset: list, val_dataset: list, test_dataset: li
             print("    Split is empty, skip statistics")
             return
 
-        e_old = [int(d.num_edges_old) for d in dataset]
-        e_new = [int(d.num_edges_new) for d in dataset]
-        y_all = torch.cat([d.y for d in dataset]).numpy()
-        mutation_dist = Counter(d.mutation_type for d in dataset)
+        e_old = [int(data.num_edges_old) for data in dataset]
+        e_new = [int(data.num_edges_new) for data in dataset]
+        y_all = torch.cat([data.y for data in dataset]).numpy()
+        mutation_dist = Counter(data.mutation_type for data in dataset)
 
         print(f"\n  [{name}] {len(dataset)} samples")
         print(f"    G  edges: fixed {e_old[0]}")
@@ -297,9 +247,9 @@ def print_dataset_stats(train_dataset: list, val_dataset: list, test_dataset: li
     print(f"\n{'=' * 60}")
     print("Dataset Statistics Summary")
     print(f"{'=' * 60}")
-    _stats_one_split(train_dataset, 'Train')
-    _stats_one_split(val_dataset, 'Val')
-    _stats_one_split(test_dataset, 'Test')
+    _stats_one_split(train_dataset, "Train")
+    _stats_one_split(val_dataset, "Val")
+    _stats_one_split(test_dataset, "Test")
 
 
 def validate_single_data_object(data: Data) -> None:
@@ -314,27 +264,23 @@ def validate_single_data_object(data: Data) -> None:
     assert data.edge_attr_old.shape == (e_old, 3), "edge_attr_old shape error"
     assert data.flow_old.shape == (e_old, 1), "flow_old shape error"
     assert data.edge_attr_new.shape == (e_new, 3), "edge_attr_new shape error"
-    assert data.edge_attr_new_real.shape == (e_new, 3), "edge_attr_new_real shape error"
-    assert data.free_flow_time_new_real.shape == (e_new, 1), "free_flow_time_new_real shape error"
     assert data.y.shape == (e_new, 1), "y shape error"
     assert data.non_centroid_mask.shape == (num_nodes,), "non_centroid_mask shape error"
     assert data.net_demand.shape == (num_nodes,), f"net_demand shape error: {data.net_demand.shape}"
     assert data.new_edge_mask.shape == (e_new,), "new_edge_mask shape error"
 
-    for name, ei in [('edge_index_old', data.edge_index_old), ('edge_index_new', data.edge_index_new)]:
-        if ei.numel() == 0:
+    for name, edge_index in [("edge_index_old", data.edge_index_old), ("edge_index_new", data.edge_index_new)]:
+        if edge_index.numel() == 0:
             continue
-        assert ei.min() >= 0, f"{name} has negative node id"
-        assert ei.max() < num_nodes, f"{name} node id out of range (max={ei.max()})"
+        assert edge_index.min() >= 0, f"{name} has negative node id"
+        assert edge_index.max() < num_nodes, f"{name} node id out of range (max={edge_index.max()})"
 
     for name, tensor in [
-        ('edge_attr_old', data.edge_attr_old),
-        ('flow_old', data.flow_old),
-        ('edge_attr_new', data.edge_attr_new),
-        ('edge_attr_new_real', data.edge_attr_new_real),
-        ('free_flow_time_new_real', data.free_flow_time_new_real),
-        ('y', data.y),
-        ('net_demand', data.net_demand),
+        ("edge_attr_old", data.edge_attr_old),
+        ("flow_old", data.flow_old),
+        ("edge_attr_new", data.edge_attr_new),
+        ("y", data.y),
+        ("net_demand", data.net_demand),
     ]:
         assert not torch.isnan(tensor).any(), f"{name} contains NaN"
         assert not torch.isinf(tensor).any(), f"{name} contains Inf"
@@ -360,52 +306,54 @@ def save_dataset_metadata(
     test_size: int,
 ) -> None:
     """Persist metadata used by loaders and downstream configs."""
-    node_ids = example_data.node_ids.tolist() if hasattr(example_data, 'node_ids') else []
+    node_ids = example_data.node_ids.tolist() if hasattr(example_data, "node_ids") else []
     centroid_nodes = [
         node_id
         for node_id, is_non_centroid in zip(node_ids, example_data.non_centroid_mask.tolist())
         if not is_non_centroid
     ]
     if len(train_dataset) == 0:
-        raise ValueError("Training dataset is empty, cannot compute global t0 reference.")
+        raise ValueError("Training dataset is empty, cannot write dataset metadata.")
 
-    train_free_flow_times = torch.cat(
-        [data.free_flow_time_new_real.view(-1) for data in train_dataset],
-        dim=0,
-    ).float()
-    train_t0_mean = float(train_free_flow_times.mean().item())
-    train_t0_median = float(train_free_flow_times.median().item())
     metadata = {
-        'network_name': str(getattr(example_data, 'network_name', 'Unknown')),
-        'num_nodes': int(example_data.num_nodes),
-        'num_edges_old': int(example_data.num_edges_old),
-        'num_edges_new': int(example_data.num_edges_new),
-        'od_dim': int(getattr(example_data, 'od_dim', 0)),
-        'centroid_count': int(getattr(example_data, 'centroid_count', 0)),
-        'node_ids': node_ids,
-        'centroid_nodes': centroid_nodes,
-        'splits': {
-            'train': int(train_size),
-            'val': int(val_size),
-            'test': int(test_size),
+        "network_name": str(getattr(example_data, "network_name", "Unknown")),
+        "num_nodes": int(example_data.num_nodes),
+        "num_edges_old": int(example_data.num_edges_old),
+        "num_edges_new": int(example_data.num_edges_new),
+        "od_dim": int(getattr(example_data, "od_dim", 0)),
+        "centroid_count": int(getattr(example_data, "centroid_count", 0)),
+        "node_ids": node_ids,
+        "centroid_nodes": centroid_nodes,
+        "splits": {
+            "train": int(train_size),
+            "val": int(val_size),
+            "test": int(test_size),
         },
-        'free_flow_time_ref': {
-            'train_mean': train_t0_mean,
-            'train_median': train_t0_median,
-        },
-        'files': {
-            'train': 'train_dataset.pt',
-            'val': 'val_dataset.pt',
-            'test': 'test_dataset.pt',
-            'attr_scaler': 'scalers/attr_scaler.pkl',
-            'flow_scaler': 'scalers/flow_scaler.pkl',
+        "files": {
+            "train": "train_dataset.pt",
+            "val": "val_dataset.pt",
+            "test": "test_dataset.pt",
+            "attr_scaler": "scalers/attr_scaler.pkl",
+            "flow_scaler": "scalers/flow_scaler.pkl",
         },
     }
 
-    meta_path = os.path.join(output_dir, 'dataset_meta.json')
-    with open(meta_path, 'w', encoding='utf-8') as f:
-        json.dump(metadata, f, indent=2)
+    meta_path = os.path.join(output_dir, "dataset_meta.json")
+    with open(meta_path, "w", encoding="utf-8") as handle:
+        json.dump(metadata, handle, indent=2)
     print(f"  Dataset metadata saved: {meta_path}")
+
+
+def save_split_indices(output_dir: str, train_idx: np.ndarray, val_idx: np.ndarray, test_idx: np.ndarray) -> None:
+    """Persist the exact split indices for downstream analysis."""
+    split_path = os.path.join(output_dir, "split_indices.npz")
+    np.savez(
+        split_path,
+        train_idx=np.asarray(train_idx, dtype=np.int64),
+        val_idx=np.asarray(val_idx, dtype=np.int64),
+        test_idx=np.asarray(test_idx, dtype=np.int64),
+    )
+    print(f"  Split indices saved:   {split_path}")
 
 
 def _print_data_summary(data: Data, split_name: str) -> None:
@@ -417,20 +365,16 @@ def _print_data_summary(data: Data, split_name: str) -> None:
     print(f"    flow_old           : {tuple(data.flow_old.shape)}")
     print(f"    edge_index_new     : {tuple(data.edge_index_new.shape)}")
     print(f"    edge_attr_new      : {tuple(data.edge_attr_new.shape)}")
-    if hasattr(data, 'edge_attr_new_real'):
-        print(f"    edge_attr_new_real : {tuple(data.edge_attr_new_real.shape)}  (raw capacity/speed/length)")
-    if hasattr(data, 'free_flow_time_new_real'):
-        print(f"    free_flow_time_new : {tuple(data.free_flow_time_new_real.shape)}  (minutes)")
     print(f"    y                  : {tuple(data.y.shape)}")
     print(
         f"    non_centroid_mask  : {tuple(data.non_centroid_mask.shape)} "
         f"(True count: {int(data.non_centroid_mask.sum())})"
     )
-    nd = data.net_demand
+    net_demand = data.net_demand
     centroid_mask = ~data.non_centroid_mask
-    centroid_values = nd[centroid_mask]
-    non_centroid_values = nd[data.non_centroid_mask]
-    print(f"    net_demand         : {tuple(nd.shape)}  (from flow divergence, NO OD)")
+    centroid_values = net_demand[centroid_mask]
+    non_centroid_values = net_demand[data.non_centroid_mask]
+    print(f"    net_demand         : {tuple(net_demand.shape)}  (from flow divergence, no OD features)")
     if centroid_values.numel() > 0:
         print(
             f"      centroid nodes   : count={centroid_values.numel()}, "
@@ -453,7 +397,7 @@ def _print_data_summary(data: Data, split_name: str) -> None:
 
 def _save_split(dataset: list, path: str, name: str) -> None:
     """Save one split to a .pt file."""
-    os.makedirs(os.path.dirname(path) if os.path.dirname(path) else '.', exist_ok=True)
+    os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
     torch.save(dataset, path)
     size_mb = os.path.getsize(path) / (1024 ** 2)
     print(f"  {name:6s}: {len(dataset):5d} samples -> {path} ({size_mb:.1f} MB)")
@@ -468,11 +412,11 @@ def run(args) -> None:
     print(f"{'=' * 60}")
     print(f"  File path: {args.input_pkl}")
 
-    with open(args.input_pkl, 'rb') as f:
-        payload = pickle.load(f)
+    with open(args.input_pkl, "rb") as handle:
+        payload = pickle.load(handle)
 
     if isinstance(payload, dict):
-        pairs = payload['pairs']
+        pairs = payload["pairs"]
         print(f"  Number of dropped samples (solve failed): {len(payload.get('failed_indices', []))}")
     else:
         pairs = payload
@@ -482,12 +426,13 @@ def run(args) -> None:
 
     first = pairs[0]
     print(f"\n  First sample fields:")
+    print(f"    network_name  : {_require_pair_metadata(first, 'network_name')}")
     print(f"    G  edges      : {len(first['edge_list_old'])}")
     print(f"    G' edges      : {len(first['edge_list_new'])}")
     print(f"    flows_old     : {first['flows_old'].shape}  (real space, veh/hr)")
     print(f"    flows_new     : {first['flows_new'].shape}  (real space, veh/hr)")
     print(f"    mutation_type : {first['mutation_type']}")
-    print("    NOTE: net_demand will be derived from flows_old divergence (NO OD matrix)")
+    print("    NOTE: net_demand will be derived from flows_old divergence (no OD features)")
 
     print(f"\n{'=' * 60}")
     print("Step 2 - Split Train / Val / Test indices")
@@ -501,6 +446,7 @@ def run(args) -> None:
     print(f"  Train : {len(train_idx)} samples ({len(train_idx) / num_samples * 100:.1f}%)")
     print(f"  Val   : {len(val_idx)} samples ({len(val_idx) / num_samples * 100:.1f}%)")
     print(f"  Test  : {len(test_idx)} samples ({len(test_idx) / num_samples * 100:.1f}%)")
+    save_split_indices(args.output_dir, train_idx, val_idx, test_idx)
 
     print(f"\n{'=' * 60}")
     print("Step 3 - Fit StandardScaler (training set only)")
@@ -512,7 +458,12 @@ def run(args) -> None:
     print("Step 4 - Build PyG Data objects")
     print(f"{'=' * 60}")
     train_dataset, val_dataset, test_dataset = build_full_dataset(
-        pairs, train_idx, val_idx, test_idx, attr_scaler, flow_scaler
+        pairs,
+        train_idx,
+        val_idx,
+        test_idx,
+        attr_scaler,
+        flow_scaler,
     )
     save_dataset_metadata(
         output_dir=args.output_dir,
@@ -526,7 +477,7 @@ def run(args) -> None:
     print(f"\n{'=' * 60}")
     print("Step 5 - Validate sample correctness")
     print(f"{'=' * 60}")
-    for name, dataset in [('Train', train_dataset), ('Val', val_dataset), ('Test', test_dataset)]:
+    for name, dataset in [("Train", train_dataset), ("Val", val_dataset), ("Test", test_dataset)]:
         if len(dataset) == 0:
             print(f"  [{name}] Split is empty, skip sample validation")
             continue
@@ -537,11 +488,11 @@ def run(args) -> None:
     print_dataset_stats(train_dataset, val_dataset, test_dataset)
 
     print(f"\n{'=' * 60}")
-    print("Step 7 - Save dataset")
+    print("Step 6 - Save dataset")
     print(f"{'=' * 60}")
-    _save_split(train_dataset, os.path.join(args.output_dir, 'train_dataset.pt'), 'Train')
-    _save_split(val_dataset, os.path.join(args.output_dir, 'val_dataset.pt'), 'Val')
-    _save_split(test_dataset, os.path.join(args.output_dir, 'test_dataset.pt'), 'Test')
+    _save_split(train_dataset, os.path.join(args.output_dir, "train_dataset.pt"), "Train")
+    _save_split(val_dataset, os.path.join(args.output_dir, "val_dataset.pt"), "Val")
+    _save_split(test_dataset, os.path.join(args.output_dir, "test_dataset.pt"), "Test")
 
     print(f"\n  All datasets saved to: {args.output_dir}/")
     print(f"  Scaler saved to:       {args.output_dir}/scalers/")
@@ -553,25 +504,20 @@ def parse_args():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
-        '--input_pkl',
+        "--input_pkl",
         type=str,
-        default='processed_data/ema_pairs/network_pairs_dataset.pkl',
-        help='Path to the pickle output by solve_network_pairs.py',
+        default="processed_data/pairs/network_pairs_dataset.pkl",
+        help="Path to the pickle output by solve_network_pairs.py",
     )
     parser.add_argument(
-        '--output_dir',
+        "--output_dir",
         type=str,
-        default='processed_data/pyg_dataset',
-        help='Output directory for .pt files, scaler files, and dataset metadata',
+        default="processed_data/pyg",
+        help="Output directory for .pt files, scaler files, and dataset metadata",
     )
-    parser.add_argument('--train_ratio', type=float, default=0.6, help='Training set ratio')
-    parser.add_argument(
-        '--val_ratio',
-        type=float,
-        default=0.2,
-        help='Validation set ratio (test = 1 - train - val)',
-    )
-    parser.add_argument('--seed', type=int, default=42, help='Random seed for split')
+    parser.add_argument("--train_ratio", type=float, default=0.6, help="Training set ratio")
+    parser.add_argument("--val_ratio", type=float, default=0.2, help="Validation set ratio (test = 1 - train - val)")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for split")
     return parser.parse_args()
 
 
@@ -602,5 +548,5 @@ def main():
     print("=" * 60)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

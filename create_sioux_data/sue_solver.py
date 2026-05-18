@@ -504,14 +504,3 @@ def load_flows(load_path='processed_data/raw/flows.npz'):
     print(f"\n Flows loaded from: {load_path}")
     return data['flows']
 
-
-if __name__ == '__main__':
-    from load_sioux import load_sioux_falls_network
-    from generate_scenarios import generate_lhs_samples
-
-    print("Testing advanced Markov-Logit SUE solver...")
-    G, _ = load_sioux_falls_network('../sioux_data/SiouxFalls_net.tntp')
-    od_mats, caps, speeds = generate_lhs_samples(num_samples=5)
-    flows = solve_sue_batch(G, od_mats, caps, speeds, method='markov_logit')
-    print("\n Test completed!")
-    print(f"  Generated flows shape: {flows.shape}")

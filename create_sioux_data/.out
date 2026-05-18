@@ -1,0 +1,35 @@
+This job can be monitored from: https://job.c3se.chalmers.se/vera/8734649
+================ Flow + SMC Bridge Fix Sweep (CPU Array) ============
+SLURM_JOB_ID           : 8734649
+SLURM_ARRAY_JOB_ID     : 8734644
+SLURM_ARRAY_TASK_ID    : 4
+TOTAL_COMBINATIONS     : 9
+SIGMA_VALUES_CSV       : 0.5
+MAX_STAGES_VALUES_CSV  : 25,50,100
+ESS_TARGET_VALUES_CSV  : 0.5,0.6,0.7
+NUM_PARTICLES_VALUE    : 128
+MH_STEPS_VALUE         : 2
+ESS_RESAMPLE_RATIO     : 0.5
+SIGMA_VALUE            : 0.5
+MAX_STAGES_VALUE       : 50
+ESS_TARGET_VALUE       : 0.6
+TASK_OUTPUT_DIR        : /cephyr/users/wuxin/Vera/Pinn/create_sioux_data/processed_data/ema_pairs/flow_smc_bridge_fix_array/sigma_0.5_stages_50_ess_0.6
+HOSTNAME               : vera-r08-03
+PWD                    : /cephyr/users/wuxin/Vera/Pinn
+START_TIME             : 2026-04-09 23:22:00
+=====================================================================
+Python binary          : /cephyr/users/wuxin/Vera/Pinn/venv_cuda/bin/python
+Python 3.9.21
+
+================================================================
+  Evaluate Conditional Flow + SMC
+================================================================
+  Launch time: 2026-04-09 23:22:02
+  Raw pairs loaded       : 4000
+  Eval mode              : oracle_subset
+  Eval pair count        : 20
+  Proposal checkpoint    : /cephyr/users/wuxin/Vera/Pinn/create_sioux_data/processed_data/ema_pairs/conditional_flow_proposal/conditional_flow_proposal_best.pt
+  Device                 : cpu
+  Likelihood mode        : train_edge_std
+  Likelihood sigma       : 0.500000
+  Prior mode             : train_diag_gaussian
