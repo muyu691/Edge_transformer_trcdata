@@ -17,6 +17,7 @@ except ModuleNotFoundError:
 _META_PATTERN = re.compile(r"<([^>]+)>\s*(.*)")
 _ORIGIN_PATTERN = re.compile(r"Origin\s+(\d+)", flags=re.IGNORECASE)
 _OD_ENTRY_PATTERN = re.compile(r"(\d+)\s*:\s*([+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)")
+_FEET_PER_MILE = 5280.0
 
 
 @dataclass(frozen=True)
@@ -68,6 +69,26 @@ def _split_data_section(lines) -> Tuple[Dict[str, str], list[str]]:
     return metadata, lines[data_start:]
 
 
+def _metadata_header(metadata: Dict[str, str]) -> str:
+    return metadata.get("original_header", "").lower()
+
+
+def _length_scale_from_metadata(metadata: Dict[str, str]) -> float:
+    """Scale parsed TNTP length values into miles when units are explicit."""
+    header = _metadata_header(metadata)
+    if re.search(r"length\s*\(\s*ft\s*\)", header):
+        return 1.0 / _FEET_PER_MILE
+    return 1.0
+
+
+def _speed_scale_from_metadata(metadata: Dict[str, str]) -> float:
+    """Scale parsed TNTP speed values into miles/hour when units are explicit."""
+    header = _metadata_header(metadata)
+    if re.search(r"speed[^;\t]*\(\s*ft\s*/\s*min\s*\)", header):
+        return 60.0 / _FEET_PER_MILE
+    return 1.0
+
+
 def parse_tntp_network(network_file: str, node_id_offset: int = 1) -> tuple[nx.DiGraph, Dict[str, str]]:
     """Parse a TNTP network file into a directed graph."""
     if not os.path.exists(network_file):
@@ -78,6 +99,8 @@ def parse_tntp_network(network_file: str, node_id_offset: int = 1) -> tuple[nx.D
 
     metadata, data_lines = _split_data_section(lines)
     graph = nx.DiGraph()
+    length_scale = _length_scale_from_metadata(metadata)
+    speed_scale = _speed_scale_from_metadata(metadata)
 
     num_nodes_meta = int(metadata.get("number_of_nodes", "0") or 0)
     if num_nodes_meta > 0:
@@ -95,13 +118,13 @@ def parse_tntp_network(network_file: str, node_id_offset: int = 1) -> tuple[nx.D
         init_node = int(float(tokens[0]))
         term_node = int(float(tokens[1]))
         capacity = float(tokens[2])
-        length = float(tokens[3])
+        length = float(tokens[3]) * length_scale
         free_flow_time = float(tokens[4])
 
         speed = None
         if len(tokens) > 7:
             try:
-                speed = float(tokens[7])
+                speed = float(tokens[7]) * speed_scale
             except ValueError:
                 speed = None
         if speed is None or speed <= 0.0:

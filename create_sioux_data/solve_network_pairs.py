@@ -38,6 +38,7 @@ import os
 import pickle
 import sys
 import warnings
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 
 import numpy as np
@@ -57,6 +58,127 @@ from network_parser import load_network_data
 from network_registry import resolve_network_spec
 from sue_solver import advanced_sue_solver, MarkovLoadingConvergenceWarning
 from utils import compute_free_flow_times
+
+
+_FIRST_SUE_WORKER_STATE = {}
+_SECOND_SUE_WORKER_STATE = {}
+
+
+def _normalise_num_workers(num_workers: int, num_tasks: int) -> int:
+    """Clamp worker count to a useful range."""
+    try:
+        value = int(num_workers)
+    except (TypeError, ValueError):
+        value = 1
+    if num_tasks <= 1:
+        return 1
+    return max(1, min(value, num_tasks))
+
+
+def _init_first_sue_worker(
+    G_topo,
+    od_matrices,
+    capacities,
+    free_flow_times,
+    solver_params: dict,
+) -> None:
+    _FIRST_SUE_WORKER_STATE.clear()
+    _FIRST_SUE_WORKER_STATE.update(
+        {
+            "G_topo": G_topo,
+            "od_matrices": od_matrices,
+            "capacities": capacities,
+            "free_flow_times": free_flow_times,
+            "solver_params": solver_params,
+        }
+    )
+
+
+def _first_sue_worker(sample_idx: int) -> dict:
+    state = _FIRST_SUE_WORKER_STATE
+    try:
+        flows_i, loading_warning, used_flow_iter = _run_advanced_sue_with_loading_retry(
+            G=state["G_topo"],
+            od_matrix=state["od_matrices"][sample_idx],
+            capacities=state["capacities"][sample_idx],
+            free_flow_times=state["free_flow_times"][sample_idx],
+            **state["solver_params"],
+        )
+        if np.any(np.isnan(flows_i)) or np.any(np.isinf(flows_i)):
+            raise ValueError("flows_old contains NaN/Inf")
+        return {
+            "index": sample_idx,
+            "flows": flows_i,
+            "loading_warning": bool(loading_warning),
+            "used_flow_iter": int(used_flow_iter),
+            "error": "",
+        }
+    except Exception as exc:
+        return {
+            "index": sample_idx,
+            "flows": None,
+            "loading_warning": False,
+            "used_flow_iter": int(state["solver_params"]["flow_iter"]),
+            "error": repr(exc),
+        }
+
+
+def _init_second_sue_worker(scenario_pairs: list, solver_params: dict) -> None:
+    _SECOND_SUE_WORKER_STATE.clear()
+    _SECOND_SUE_WORKER_STATE.update(
+        {
+            "scenario_pairs": scenario_pairs,
+            "solver_params": solver_params,
+        }
+    )
+
+
+def _second_sue_worker(sample_idx: int) -> dict:
+    state = _SECOND_SUE_WORKER_STATE
+    pair = state["scenario_pairs"][sample_idx]
+    G_prime = pair["G_prime"]
+    od_matrix = pair["od_matrix"]
+
+    try:
+        flows_new, loading_warning, used_flow_iter = solve_single_graph_sue(
+            G_prime,
+            od_matrix,
+            **state["solver_params"],
+        )
+        edge_list_old = list(pair["G"].edges())
+        edge_list_new = list(G_prime.edges())
+        completed_pair = {
+            'od_matrix'    : pair['od_matrix'],
+            'G'            : pair['G'],
+            'G_prime'      : G_prime,
+            'mutation_type': pair['mutation_type'],
+            'mutation_info': pair['mutation_info'],
+            'flows_old'    : pair['flows_old'],
+            'flows_new'    : flows_new,
+            'edge_list_old': edge_list_old,
+            'edge_list_new': edge_list_new,
+            'network_name' : pair.get('network_name', 'Unknown'),
+            'node_ids'     : tuple(pair.get('node_ids', tuple(sorted(pair['G'].nodes())))),
+            'centroid_nodes': tuple(pair.get('centroid_nodes', tuple())),
+            'node_id_offset': pair.get('node_id_offset', 1),
+        }
+        return {
+            "index": sample_idx,
+            "pair": completed_pair,
+            "loading_warning": bool(loading_warning),
+            "used_flow_iter": int(used_flow_iter),
+            "error": "",
+            "mutation_type": pair["mutation_type"],
+        }
+    except Exception as exc:
+        return {
+            "index": sample_idx,
+            "pair": None,
+            "loading_warning": False,
+            "used_flow_iter": int(state["solver_params"]["flow_iter"]),
+            "error": repr(exc),
+            "mutation_type": pair.get("mutation_type", "unknown"),
+        }
 
 
 # ============================================================
@@ -220,6 +342,7 @@ def run_first_sue_solve(
     flow_iter: int = 500,
     flow_tol: float = 1e-9,
     retry_flow_iter: int = 2000,
+    num_workers: int = 1,
 ) -> np.ndarray:
     """
     First SUE batch solving: compute flows_old on fixed topology G.
@@ -259,38 +382,67 @@ def run_first_sue_solve(
 
     failed_count = 0
     loading_warning_indices = []
-    for i in tqdm(range(num_samples), desc="  First SUE solve"):
-        try:
-            flows_i, loading_warning, used_flow_iter = _run_advanced_sue_with_loading_retry(
-                G=G_topo,
-                od_matrix=od_matrices[i],
-                capacities=capacities[i],
-                free_flow_times=free_flow_times[i],
-                max_iter=max_iter,
-                convergence_threshold=convergence_threshold,
-                theta=theta,
-                value_iter=value_iter,
-                value_tol=value_tol,
-                flow_iter=flow_iter,
-                flow_tol=flow_tol,
-                retry_flow_iter=retry_flow_iter,
-            )
-            if np.any(np.isnan(flows_i)) or np.any(np.isinf(flows_i)):
-                raise ValueError("flows_old contains NaN/Inf")
-            flows_old[i] = flows_i
-            if loading_warning:
-                loading_warning_indices.append(i)
-                if len(loading_warning_indices) <= 5:
-                    print(
-                        f"  [Warning] Scenario {i} kept approximate inner loading "
-                        f"after flow_iter={used_flow_iter}."
-                    )
-        except Exception as e:
-            # The base G is strongly connected, first solve failures are extremely rare, log and continue zeroed
+    worker_count = _normalise_num_workers(num_workers, num_samples)
+    solver_params = {
+        "max_iter": max_iter,
+        "convergence_threshold": convergence_threshold,
+        "theta": theta,
+        "value_iter": value_iter,
+        "value_tol": value_tol,
+        "flow_iter": flow_iter,
+        "flow_tol": flow_tol,
+        "retry_flow_iter": retry_flow_iter,
+    }
+    print(f"  First SUE workers: {worker_count}")
+
+    def _consume_result(result: dict) -> None:
+        nonlocal failed_count
+        i = int(result["index"])
+        if result["error"]:
             failed_count += 1
             flows_old[i] = 0.0
-            if failed_count <= 5:  # Avoid logs exploding, print only first 5 entries
-                print(f"  [Warning] Scenario {i} first solve failed: {e}")
+            if failed_count <= 5:
+                print(f"  [Warning] Scenario {i} first solve failed: {result['error']}")
+            return
+
+        flows_old[i] = result["flows"]
+        if result["loading_warning"]:
+            loading_warning_indices.append(i)
+            if len(loading_warning_indices) <= 5:
+                print(
+                    f"  [Warning] Scenario {i} kept approximate inner loading "
+                    f"after flow_iter={result['used_flow_iter']}."
+                )
+
+    if worker_count == 1:
+        _init_first_sue_worker(
+            G_topo,
+            od_matrices,
+            capacities,
+            free_flow_times,
+            solver_params,
+        )
+        for i in tqdm(range(num_samples), desc="  First SUE solve"):
+            _consume_result(_first_sue_worker(i))
+    else:
+        with ProcessPoolExecutor(
+            max_workers=worker_count,
+            initializer=_init_first_sue_worker,
+            initargs=(
+                G_topo,
+                od_matrices,
+                capacities,
+                free_flow_times,
+                solver_params,
+            ),
+        ) as executor:
+            futures = [executor.submit(_first_sue_worker, i) for i in range(num_samples)]
+            for future in tqdm(
+                as_completed(futures),
+                total=num_samples,
+                desc="  First SUE solve",
+            ):
+                _consume_result(future.result())
 
     print(f"\n  First SUE solve complete!")
     print(f"  flows_old shape: {flows_old.shape}")
@@ -323,6 +475,7 @@ def run_second_sue_solve(
     retry_flow_iter: int = 2000,
     checkpoint_path: str = None,
     checkpoint_interval: int = 200,
+    num_workers: int = 1,
 ) -> tuple:
     """
     Second SUE solving: solve each G' independently, then merge into final data pairs.
@@ -360,73 +513,80 @@ def run_second_sue_solve(
     if checkpoint_path:
         print(f"  Checkpoint save path: {checkpoint_path} (every {checkpoint_interval} samples)")
 
-    completed_pairs = []
+    completed_by_index = {}
     failed_indices  = []
     loading_warning_indices = []
+    worker_count = _normalise_num_workers(num_workers, num_pairs)
+    solver_params = {
+        "max_iter": max_iter,
+        "convergence_threshold": convergence_threshold,
+        "theta": theta,
+        "value_iter": value_iter,
+        "value_tol": value_tol,
+        "flow_iter": flow_iter,
+        "flow_tol": flow_tol,
+        "retry_flow_iter": retry_flow_iter,
+    }
+    print(f"  Second SUE workers: {worker_count}")
 
-    for i, pair in enumerate(tqdm(scenario_pairs, desc="  Second SUE solve")):
-        G_prime   = pair['G_prime']
-        od_matrix = pair['od_matrix']
+    def _ordered_completed_pairs() -> list:
+        return [completed_by_index[i] for i in sorted(completed_by_index)]
 
-        try:
-            # --- Main: Solve SUE on G' ---
-            # G' may have different number/order of edges (due to add/delete edge mutations),
-            # solve_single_graph_sue extracts capacity and free_flow_time from G', 
-            # and returns flows_new as indexed by current list(G'.edges()).
-            flows_new, loading_warning, used_flow_iter = solve_single_graph_sue(
-                G_prime,
-                od_matrix,
-                max_iter=max_iter,
-                convergence_threshold=convergence_threshold,
-                theta=theta,
-                value_iter=value_iter,
-                value_tol=value_tol,
-                flow_iter=flow_iter,
-                flow_tol=flow_tol,
-                retry_flow_iter=retry_flow_iter,
-            )
-            if loading_warning:
+    def _consume_result(result: dict, processed_count: int) -> None:
+        i = int(result["index"])
+        if result["error"]:
+            failed_indices.append(i)
+            if len(failed_indices) <= 10:
+                print(
+                    f"\n  [Skipped] Sample {i} "
+                    f"(mutation={result['mutation_type']}): {result['error']}"
+                )
+        else:
+            completed_by_index[i] = result["pair"]
+            if result["loading_warning"]:
                 loading_warning_indices.append(i)
                 if len(loading_warning_indices) <= 5:
                     print(
                         f"\n  [Warning] Sample {i} kept approximate inner loading "
-                        f"after flow_iter={used_flow_iter}."
+                        f"after flow_iter={result['used_flow_iter']}."
                     )
 
-            # --- Build complete data pair ---
-            # Explicitly save edge_list_old/new to eliminate edge order ambiguity in later build_network_pairs_dataset.py.
-            # Can't rely on re-calling list(G.edges()) to recover order, since after pickle deserialization 
-            # the graph object's iteration order may theoretically differ from when saved (even though NetworkX is usually stable).
-            edge_list_old = list(pair['G'].edges())
-            edge_list_new = list(G_prime.edges())
-
-            completed_pairs.append({
-                'od_matrix'    : pair['od_matrix'],         # [11, 11], only for SUE
-                'G'            : pair['G'],                 # NetworkX DiGraph
-                'G_prime'      : G_prime,                   # NetworkX DiGraph
-                'mutation_type': pair['mutation_type'],
-                'mutation_info': pair['mutation_info'],
-                'flows_old'    : pair['flows_old'],         # [E_old], indexed by edge_list_old
-                'flows_new'    : flows_new,                 # [E_new], indexed by edge_list_new
-                'edge_list_old': edge_list_old,             # list[(u,v)], E_old entries
-                'edge_list_new': edge_list_new,             # list[(u,v)], E_new entries
-                'network_name' : pair.get('network_name', 'Unknown'),
-                'node_ids'     : tuple(pair.get('node_ids', tuple(sorted(pair['G'].nodes())))),
-                'centroid_nodes': tuple(pair.get('centroid_nodes', tuple())),
-                'node_id_offset': pair.get('node_id_offset', 1),
-            })
-
-        except Exception as e:
-            # Log failed samples but do not interrupt the pipeline
-            failed_indices.append(i)
-            if len(failed_indices) <= 10:  # Only print first 10, avoid exploding logs
-                print(f"\n  [Skipped] Sample {i} (mutation={pair['mutation_type']}): {e}")
-
-        # Periodically save checkpoint (to prevent long-running crashes losing progress)
         if (checkpoint_path is not None
-                and (i + 1) % checkpoint_interval == 0
-                and completed_pairs):
-            _save_checkpoint(completed_pairs, failed_indices, checkpoint_path, i + 1)
+                and processed_count % checkpoint_interval == 0
+                and completed_by_index):
+            _save_checkpoint(
+                _ordered_completed_pairs(),
+                sorted(failed_indices),
+                checkpoint_path,
+                processed_count,
+            )
+
+    if worker_count == 1:
+        _init_second_sue_worker(scenario_pairs, solver_params)
+        for processed_count, i in enumerate(
+            tqdm(range(num_pairs), desc="  Second SUE solve"),
+            start=1,
+        ):
+            _consume_result(_second_sue_worker(i), processed_count)
+    else:
+        with ProcessPoolExecutor(
+            max_workers=worker_count,
+            initializer=_init_second_sue_worker,
+            initargs=(scenario_pairs, solver_params),
+        ) as executor:
+            futures = [executor.submit(_second_sue_worker, i) for i in range(num_pairs)]
+            for processed_count, future in enumerate(
+                tqdm(
+                    as_completed(futures),
+                    total=num_pairs,
+                    desc="  Second SUE solve",
+                ),
+                start=1,
+            ):
+                _consume_result(future.result(), processed_count)
+
+    completed_pairs = _ordered_completed_pairs()
+    failed_indices = sorted(failed_indices)
 
     # Final statistics report
     total   = num_pairs
@@ -593,6 +753,7 @@ def run_pipeline(args) -> list:
             flow_iter=args.flow_iter,
             flow_tol=args.flow_tol,
             retry_flow_iter=args.retry_flow_iter,
+            num_workers=args.num_workers,
         )
         np.save(flows_old_path, flows_old)
         print(f"  flows_old saved: {flows_old_path}")
@@ -637,6 +798,7 @@ def run_pipeline(args) -> list:
         retry_flow_iter=args.retry_flow_iter,
         checkpoint_path=checkpoint_path if args.checkpoint else None,
         checkpoint_interval=args.checkpoint_interval,
+        num_workers=args.num_workers,
     )
 
     # ---- Step 6: Save final dataset ----
@@ -765,6 +927,8 @@ def parse_args():
                         help='Inner Markov loading tolerance')
     parser.add_argument('--retry_flow_iter', type=int, default=2000,
                         help='Retry inner Markov loading with this iteration cap when warning occurs; set <= flow_iter to disable')
+    parser.add_argument('--num_workers', type=int, default=1,
+                        help='Number of worker processes for scenario-level SUE parallelism')
 
     # Resume job support
     parser.add_argument('--skip_first_solve', action='store_true',

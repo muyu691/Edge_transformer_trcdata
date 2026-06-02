@@ -484,6 +484,14 @@ def main() -> None:
         linestyle=(0, (4, 2)),
         label="removed directed link",
     )
+    axes[0].plot(
+        [],
+        [],
+        color="#1f9e89",
+        linewidth=1.8,
+        linestyle="solid",
+        label="directed link",
+    )
     axes[0].legend(loc="lower left", frameon=True, framealpha=0.88, fontsize=8)
 
     network_name = {

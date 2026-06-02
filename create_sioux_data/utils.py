@@ -9,11 +9,14 @@ import torch
 def compute_free_flow_times(G, speeds):
     """
     Compute free-flow travel times for each scenario.
-    
-    Formula: time (minutes) = length (km) / speed (km/h) * 60
+
+    Formula: time (minutes) = length / speed * 60, where parsed network
+    lengths and generated speeds are normalized to compatible distance/hour
+    units by network_parser.py. For example, Anaheim TNTP Length (ft) and
+    Speed (ft/min) are converted to miles and miles/hour at parse time.
     
     Args:
-        G: NetworkX graph with 'length' edge attribute
+        G: NetworkX graph with normalized 'length' edge attribute
         speeds: [num_samples, num_edges] - speeds for each edge in each scenario
     
     Returns:
@@ -26,8 +29,7 @@ def compute_free_flow_times(G, speeds):
     free_flow_times = np.zeros((num_samples, num_edges))
     
     for i, (u, v) in enumerate(edges):
-        length = G[u][v]['length']  # km
-        # Time = length / speed * 60 (convert to minutes)
+        length = G[u][v]['length']
         free_flow_times[:, i] = (length / speeds[:, i]) * 60
     
     return free_flow_times
@@ -151,4 +153,3 @@ def create_data_directories():
     for directory in directories:
         os.makedirs(directory, exist_ok=True)
         print(f"  Created/verified directory: {directory}")
-

@@ -1,26 +1,9 @@
-"""
-高阶随机用户均衡 (SUE) 求解器：Markov-Logit 网络加载 + MSA-SR 外层寻优
-
-理论核心（与 Dial 节点遍历加载法区分）：
-1) Markov Routing / Equivalent Absorbing Markov Chain:
-   - 对每个目的地 d，构造路段转移概率 p_{uv}^d；
-   - 利用访问量固定点 x = q + P^T x（等价于 (I - P^T)x = q）进行全网络并行加载；
-   - 全程使用矩阵/稀疏算子，避免显式节点遍历循环。
-2) MSA-SR（自调节连续平均法）：
-   - 步长基础形式 alpha_k = beta / k^gamma；
-   - 结合相对收敛间隙趋势进行自调节，显著优于标准 1/k 的固定衰减。
-
-注意：
-- 保留原项目兼容接口：frank_wolfe_sue(...) 与 solve_sue_batch(...)。
-- 保留 BPR 拥堵更新逻辑（仅强化数值稳定性）。
-- 严格不把 OD 作为模型输入特征；OD 仅用于 SUE 物理求解。
-"""
-
 import warnings
 
 import networkx as nx
 import numpy as np
 import scipy.sparse as sp
+from scipy.sparse.csgraph import dijkstra
 from tqdm import tqdm
 
 
@@ -36,7 +19,7 @@ class MarkovLoadingConvergenceWarning(UserWarning):
 
 def bpr_travel_time(flow, capacity, free_flow_time, alpha=0.15, beta=4.0):
     """
-    BPR 路段阻抗函数：
+    BPR 
     t = t0 * (1 + alpha * (flow / capacity)^beta)
     """
     with warnings.catch_warnings():
@@ -47,11 +30,6 @@ def bpr_travel_time(flow, capacity, free_flow_time, alpha=0.15, beta=4.0):
 
 
 def _build_sparse_edge_incidence(num_nodes, tails, heads):
-    """
-    构造稀疏关联矩阵：
-    - out_mat: [N, E]，按尾节点聚合（每列在 tail 处为 1）
-    - in_mat : [N, E]，按头节点聚合（每列在 head 处为 1）
-    """
     num_edges = tails.shape[0]
     edge_ids = np.arange(num_edges, dtype=np.int64)
     ones = np.ones(num_edges, dtype=np.float64)
@@ -61,15 +39,58 @@ def _build_sparse_edge_incidence(num_nodes, tails, heads):
 
 
 def _centroid_destination_nodes(od_matrix, num_nodes):
-    """
-    约定：OD 矩阵大小为 [C, C]，对应图中的节点 ID 1..C（0-index 后为 0..C-1）。
-    """
     num_centroids = int(od_matrix.shape[0])
     if num_centroids > num_nodes:
         raise ValueError(
             f"OD centroid count ({num_centroids}) exceeds graph nodes ({num_nodes})."
         )
     return np.arange(num_centroids, dtype=np.int64)
+
+
+def _compute_reasonable_link_mask(travel_times, tails, heads, num_nodes, dest_nodes):
+    """
+    Keep only links that move closer to each destination.
+
+    Dense cyclic networks with small link costs can make unrestricted
+    recursive-logit loading circulate indefinitely instead of being absorbed at
+    the destination.  A destination-specific downhill mask preserves stochastic
+    route choice over reasonable links while making the Markov chain proper.
+    """
+    num_edges = tails.shape[0]
+    tt = np.asarray(travel_times, dtype=np.float64).reshape(num_edges)
+
+    reverse_graph = sp.csr_matrix((tt, (heads, tails)), shape=(num_nodes, num_nodes))
+    dist = dijkstra(
+        csgraph=reverse_graph,
+        directed=True,
+        indices=dest_nodes,
+        return_predecessors=False,
+    )
+    dist = np.atleast_2d(dist).T
+
+    tail_dist = dist[tails, :]
+    head_dist = dist[heads, :]
+    reasonable = np.isfinite(tail_dist) & np.isfinite(head_dist) & (
+        head_dist < tail_dist - 1e-12
+    )
+    reasonable[tails[:, None] == dest_nodes[None, :]] = False
+
+    outgoing = [np.flatnonzero(tails == node) for node in range(num_nodes)]
+    for dest_col, dest_node in enumerate(dest_nodes):
+        for node in range(num_nodes):
+            if node == int(dest_node):
+                continue
+            edge_ids = outgoing[node]
+            if edge_ids.size == 0 or np.any(reasonable[edge_ids, dest_col]):
+                continue
+            finite_edge_ids = edge_ids[np.isfinite(dist[heads[edge_ids], dest_col])]
+            if finite_edge_ids.size == 0:
+                continue
+            scores = tt[finite_edge_ids] + dist[heads[finite_edge_ids], dest_col]
+            best_edge = finite_edge_ids[int(np.argmin(scores))]
+            reasonable[best_edge, dest_col] = True
+
+    return reasonable
 
 
 def _solve_recursive_logit_values(
@@ -79,17 +100,10 @@ def _solve_recursive_logit_values(
     out_mat,
     dest_nodes,
     theta,
+    reasonable_mask=None,
     max_iter=200,
     tol=1e-8,
 ):
-    """
-    向量化 Bellman-LogSum 固定点（并行处理全部目的地）：
-
-      V_u^d = -1/theta * log( sum_{(u,v)} exp( -theta * (c_uv + V_v^d) ) )
-      V_d^d = 0
-
-    这是 Markov Routing 下构建转移概率的“值函数”步骤。
-    """
     num_nodes = int(out_mat.shape[0])
     num_edges = tails.shape[0]
     num_dests = dest_nodes.shape[0]
@@ -103,15 +117,15 @@ def _solve_recursive_logit_values(
         utility = -theta * (tt[:, None] + V[heads, :])
         utility = np.clip(utility, EXP_CLIP_MIN, EXP_CLIP_MAX)
         z = np.exp(utility)  # [E, D]
+        if reasonable_mask is not None:
+            z = z * reasonable_mask
 
         # S_u,d = sum_{e from u} z_e,d
         S = out_mat @ z  # [N, D]
         V_new = -np.log(np.maximum(S, EPS)) / theta
 
-        # 目的地边界条件：V_d^d = 0
         V_new[dest_nodes, np.arange(num_dests)] = 0.0
 
-        # 不可达数值保护（S 过小表示近乎不可达）
         unreachable = S <= EPS
         if np.any(unreachable):
             V_new[unreachable] = V_MAX
@@ -138,57 +152,57 @@ def _markov_logit_network_loading(
     flow_iter=500,
     flow_tol=1e-9,
 ):
-    """
-    Markov-Logit 全网络随机加载（无显式节点遍历）：
-
-    Step A: 求值函数 V^d（Bellman-LogSum 并行固定点）
-    Step B: 构造转移概率 p_e^d
-    Step C: 求节点访问量固定点 x = q + P^T x（Richardson 近似解）
-    Step D: 路段流量 f_e = sum_d x_tail(e)^d * p_e^d
-    """
     num_nodes = out_mat.shape[0]
     num_edges = tails.shape[0]
 
     od = np.asarray(od_matrix, dtype=np.float64)
     dest_nodes = _centroid_destination_nodes(od, num_nodes)
     num_dests = dest_nodes.shape[0]
+    tt = np.asarray(travel_times, dtype=np.float64).reshape(num_edges)
+    reasonable_mask = _compute_reasonable_link_mask(
+        travel_times=tt,
+        tails=tails,
+        heads=heads,
+        num_nodes=num_nodes,
+        dest_nodes=dest_nodes,
+    )
 
-    # A. 并行求值函数
     V = _solve_recursive_logit_values(
-        travel_times=travel_times,
+        travel_times=tt,
         tails=tails,
         heads=heads,
         out_mat=out_mat,
         dest_nodes=dest_nodes,
         theta=theta,
+        reasonable_mask=reasonable_mask,
         max_iter=value_iter,
         tol=value_tol,
     )  # [N, D]
 
-    # B. 构造边转移概率 p_e^d
-    utility = -theta * (np.asarray(travel_times, dtype=np.float64)[:, None] + V[heads, :])
+    utility = -theta * (tt[:, None] + V[heads, :])
     utility = np.clip(utility, EXP_CLIP_MIN, EXP_CLIP_MAX)
     z = np.exp(utility)  # [E, D]
+    z = z * reasonable_mask
     S = out_mat @ z      # [N, D]
-    p = z / np.maximum(S[tails, :], EPS)
+    p = np.zeros_like(z)
+    denom = S[tails, :]
+    valid = denom > EPS
+    p[valid] = z[valid] / denom[valid]
 
-    # 目的地吸收：目的节点不再外流（对应吸收马尔可夫链边界）
     is_out_of_dest = tails[:, None] == dest_nodes[None, :]
     p[is_out_of_dest] = 0.0
     p = np.clip(p, 0.0, 1.0)
 
-    # C. 目的地并行注入向量 q：q[i,d] = OD(i,d)，且 q[d,d] = 0
     q = np.zeros((num_nodes, num_dests), dtype=np.float64)
     q[:num_dests, :] = od
     q[dest_nodes, np.arange(num_dests)] = 0.0
 
-    x = q.copy()  # 节点访问量（每个目的地一列）
+    x = q.copy()  
     loading_converged = False
     for _ in range(flow_iter):
         edge_flow_by_dest = x[tails, :] * p        # [E, D]
         x_new = q + (in_mat @ edge_flow_by_dest)   # [N, D]
 
-        # 防止漂移导致负值（理论上不应出现）
         x_new = np.maximum(x_new, 0.0)
 
         rel = np.linalg.norm(x_new - x) / (np.linalg.norm(x) + 1.0)
@@ -197,7 +211,6 @@ def _markov_logit_network_loading(
             loading_converged = True
             break
 
-    # D. 聚合到路段流量
     edge_flow_by_dest = x[tails, :] * p
     flows = np.sum(edge_flow_by_dest, axis=1)  # [E]
     flows = np.nan_to_num(flows, nan=0.0, posinf=0.0, neginf=0.0)
@@ -205,12 +218,6 @@ def _markov_logit_network_loading(
 
 
 def _relative_gap(flows, aux_flows, travel_times):
-    """
-    相对收敛间隙（Relative Gap）：
-    - flow_gap: ||x^{k+1}-x^k|| / ||x^k||
-    - cost_gap: |t(x)^T x - t(x)^T y| / max(t(x)^T x, eps)
-      其中 y 为当前阻抗下的随机加载解（搜索方向目标）
-    """
     x = np.asarray(flows, dtype=np.float64)
     y = np.asarray(aux_flows, dtype=np.float64)
     t = np.asarray(travel_times, dtype=np.float64)
@@ -223,13 +230,6 @@ def _relative_gap(flows, aux_flows, travel_times):
 
 
 def _msa_sr_step(iteration, flow_gap, prev_flow_gap, beta=1.2, gamma=0.72):
-    """
-    自调节 MSA-SR 步长：
-      alpha_k = beta / (k^gamma)
-    并按 gap 变化趋势修正：
-      - 若下降停滞（ratio 接近 1），适度增大步长；
-      - 若震荡/反弹（ratio > 1），收缩步长稳定迭代。
-    """
     k = max(int(iteration), 1)
     alpha = beta / (k ** gamma)
 
@@ -261,23 +261,12 @@ def markov_logit_sue_solver(
     flow_iter=500,
     flow_tol=1e-9,
 ):
-    """
-    高性能 Markov-Logit SUE 主求解器（推荐入口）。
-
-    输入/输出签名与旧版 frank_wolfe_sue 保持一致：
-      输入: G, od_matrix, capacities, free_flow_times
-      输出: 与 list(G.edges()) 对齐的一维路段流量数组 [E]
-
-    外层：MSA-SR
-      x^{k+1} = (1-alpha_k) x^k + alpha_k * y^k
-      其中 y^k 为当前阻抗下的 Markov-Logit 全网络随机加载解。
-    """
     edges = list(G.edges())
     num_edges = len(edges)
     if num_edges == 0:
         return np.zeros(0, dtype=np.float64)
 
-    # Graph edge arrays (严格按 list(G.edges()) 顺序)
+    # Graph edge arrays 
     tails = np.asarray([u - 1 for u, _ in edges], dtype=np.int64)
     heads = np.asarray([v - 1 for _, v in edges], dtype=np.int64)
     num_nodes = int(max(np.max(tails), np.max(heads)) + 1)
@@ -289,7 +278,6 @@ def markov_logit_sue_solver(
     cap = np.maximum(cap, EPS)
     t0 = np.maximum(t0, EPS)
 
-    # 初值：自由流阻抗下做一次 Markov-Logit 加载
     loading_warning_count = 0
     flows, loading_converged = _markov_logit_network_loading(
         travel_times=t0,
@@ -343,7 +331,6 @@ def markov_logit_sue_solver(
                 f"flow_gap={flow_gap:.6e} | cost_gap={cost_gap:.6e} | update_gap={update_gap:.6e}"
             )
 
-        # 严格终止：同时满足行为 gap 与更新 gap
         if max(flow_gap, cost_gap, update_gap) < convergence_threshold:
             if verbose:
                 print(f"  SUE converged at iter {it}, gap={max(flow_gap, cost_gap, update_gap):.3e}")
@@ -376,9 +363,6 @@ def advanced_sue_solver(
     flow_iter=500,
     flow_tol=1e-9,
 ):
-    """
-    与 markov_logit_sue_solver 等价的学术入口别名。
-    """
     return markov_logit_sue_solver(
         G=G,
         od_matrix=od_matrix,
@@ -408,9 +392,6 @@ def frank_wolfe_sue(
     flow_iter=500,
     flow_tol=1e-9,
 ):
-    """
-    兼容旧调用名：内部切换到高级 Markov-Logit SUE（MSA-SR）。
-    """
     return markov_logit_sue_solver(
         G=G,
         od_matrix=od_matrix,
@@ -438,9 +419,6 @@ def solve_sue_batch(
     flow_iter=500,
     flow_tol=1e-9,
 ):
-    """
-    批量求解 SUE（兼容旧接口）。
-    """
     try:
         from .utils import compute_free_flow_times
     except ImportError:
@@ -490,7 +468,6 @@ def solve_sue_batch(
 
 
 def save_flows(flows, save_path='processed_data/raw/flows.npz'):
-    """保存求解流量结果。"""
     import os
 
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
@@ -499,8 +476,6 @@ def save_flows(flows, save_path='processed_data/raw/flows.npz'):
 
 
 def load_flows(load_path='processed_data/raw/flows.npz'):
-    """加载已保存的流量结果。"""
     data = np.load(load_path)
     print(f"\n Flows loaded from: {load_path}")
     return data['flows']
-

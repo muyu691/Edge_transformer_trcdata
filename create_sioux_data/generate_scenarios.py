@@ -43,10 +43,11 @@ def generate_lhs_base_scenarios(
     """
     Use Latin Hypercube Sampling (LHS) to generate base scenario OD matrices and edge attributes for G.
 
-    Parameter ranges (from paper specifications):
+    Parameter ranges (from paper specifications, after network_parser.py
+    normalizes explicit TNTP units such as Anaheim ft / ft-min to miles / mph):
     - OD demand: 0 - 1500 vehicles/OD pair
     - Capacity: 4000 - 26000
-    - Speed: 45 - 80 km/h
+    - Speed: 45 - 80 distance/hour units
 
     Args:
         num_samples:   Number of scenarios to generate (default 2000)
@@ -214,6 +215,7 @@ def mutate_add_edges(
        - Target node: uniform random sample from all nodes in G, excluding self and already connected targets
        - New edge attributes: uniformly sample within [min, max] of each attribute from existing edges; ensures reasonable values
        - Automatically calculate free_flow_time = (length / speed) * 60
+         after parser-level unit normalization
 
     Args:
         G:                  Current scenario NetworkX DiGraph (with full edge attributes)
@@ -260,7 +262,8 @@ def mutate_add_edges(
             new_cap = float(rng.uniform(cap_min, cap_max))
             new_spd = float(rng.uniform(spd_min, spd_max))
             new_len = float(rng.uniform(len_min, len_max))
-            # free_flow_time (minutes) = length (km) / speed (km/h) * 60
+            # free_flow_time (minutes) = length / speed * 60
+            # after parser-level unit normalization.
             new_fft = (new_len / new_spd) * 60.0
 
             G_new.add_edge(
@@ -392,7 +395,7 @@ def mutate_attributes(
 
         new_cap = float(np.clip(old_cap * cap_scale, capacity_bounds[0], capacity_bounds[1]))
         new_spd = float(np.clip(old_spd * spd_scale, speed_bounds[0], speed_bounds[1]))
-        # free_flow_time (minutes) = length (km) / speed (km/h) * 60
+        # free_flow_time (minutes) = length / speed * 60 after unit normalization.
         new_fft = (old_len / new_spd) * 60.0
 
         G_new[u][v]['capacity']       = new_cap
