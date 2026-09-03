@@ -2,7 +2,7 @@
 # GPU Slurm launcher for training the Edge Transformer model on Anaheim.
 #
 # Expected dataset:
-#   create_sioux_data/processed_data/anaheim_pyg_newpolicy_lhs
+#   create_sioux_data/processed_data/anaheim_pyg_baseline_perturb
 #
 # Typical usage on Vera:
 #   sbatch run_anaheim_edge_transformer_vera_gpu.sh
@@ -37,7 +37,7 @@ CONFIG_PATH="${CONFIG_PATH:-${PROJECT_ROOT}/configs/GatedGCN/network-pairs-topol
 PROCESSED_ROOT="${PROCESSED_ROOT:-${PROJECT_ROOT}/create_sioux_data/processed_data}"
 DATASET_NAME="${DATASET_NAME:-anaheim}"
 NETWORK_NAME="${NETWORK_NAME:-Anaheim}"
-DATASET_DIR="${DATASET_DIR:-${PROCESSED_ROOT}/anaheim_pyg_newpolicy_lhs}"
+DATASET_DIR="${DATASET_DIR:-${PROCESSED_ROOT}/anaheim_pyg_baseline_perturb}"
 
 DEVICE_VALUE="${DEVICE_VALUE:-cuda}"
 HIDDEN_DIM="${HIDDEN_DIM:-128}"
@@ -46,13 +46,15 @@ EPOCHS="${EPOCHS:-200}"
 LR_VALUE="${LR_VALUE:-0.001}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-1e-5}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${PROJECT_ROOT}/results/ours}"
-RUN_TAG="${RUN_TAG:-edge_transformer_anaheim_newpolicy_lhs}"
+RUN_TAG="${RUN_TAG:-ours_edge_transformer_anaheim_10000}"
+
+set_topology_main_hparams
 
 cd "${PROJECT_ROOT}"
 
 if [[ ! -f "${DATASET_DIR}/dataset_meta.json" ]]; then
   echo "Missing processed Anaheim dataset: ${DATASET_DIR}/dataset_meta.json" >&2
-  echo "Run anaheim_generation.sh first, or set DATASET_DIR to the processed PyG directory." >&2
+  echo "Run anaheim_generation_fast_vera.sh first, or set DATASET_DIR to the processed PyG directory." >&2
   exit 1
 fi
 
@@ -63,6 +65,9 @@ echo "HOSTNAME       : $(hostname)"
 echo "PWD            : $(pwd)"
 echo "NETWORK_NAME   : ${NETWORK_NAME}"
 echo "DATASET_DIR    : ${DATASET_DIR}"
+echo "LAMBDA_NEW     : ${LAMBDA_NEW_FINAL}"
+echo "LAMBDA_CON     : ${LAMBDA_CON}"
+echo "CON_SCHEDULE   : ${LAMBDA_CON_SCHEDULE}"
 echo "RUN_TAG        : ${RUN_TAG}"
 echo "START_TIME     : $(date '+%Y-%m-%d %H:%M:%S')"
 echo "====================================================================="
@@ -93,7 +98,7 @@ srun python main.py \
   accelerator "${DEVICE_VALUE}" \
   topology_gnn.hidden_dim "${HIDDEN_DIM}" \
   topology_gnn.num_diffusion_steps 4 \
-  topology_gnn.attention_every_k_steps 2 \
+  topology_gnn.attention_every_k_steps 1 \
   topology_gnn.dropout 0.1 \
   topology_gnn.residual True \
   topology_gnn.num_heads 4 \
@@ -115,6 +120,12 @@ srun python main.py \
   topology_gnn.pressure_update_mode "lwr" \
   topology_gnn.share_diffusion_cell True \
   topology_gnn.alignment_mode "full" \
+  model.lambda_new_final "${LAMBDA_NEW_FINAL}" \
+  model.lambda_con "${LAMBDA_CON}" \
+  model.lambda_con_schedule "${LAMBDA_CON_SCHEDULE}" \
+  model.lambda_con_mid "${LAMBDA_CON_MID}" \
+  model.lambda_con_zero_epochs 50 \
+  model.lambda_con_mid_epoch 120 \
   train.batch_size "${BATCH_SIZE}" \
   optim.max_epoch "${EPOCHS}" \
   optim.base_lr "${LR_VALUE}" \

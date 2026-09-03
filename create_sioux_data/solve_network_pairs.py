@@ -2,10 +2,10 @@
 Dual flow solving pipeline: (G, G') network pair complete data generation
 
 Full procedure steps:
-  Step 1 — LHS sampling        : Generate base scenario parameters (OD matrix, capacity, speed)
-  Step 2 — First SUE solving   : Run Frank-Wolfe on G → flows_old [N, E_old]
-  Step 3 — Network pair creation: Call generate_network_pairs, passing flows_old to locate high-flow nodes
-  Step 4 — Second SUE solving  : Run Frank-Wolfe on each G' → flows_new [E_new_i]
+  Step 1 — Baseline perturbation: Perturb the TNTP OD and network attributes multiplicatively
+  Step 2 — First SUE solving    : Run Markov-logit SUE on G → flows_old [N, E_old]
+  Step 3 — Network reconfiguration: Apply exactly one flow-independent intervention to obtain G'
+  Step 4 — Second SUE solving   : Run the same Markov-logit SUE on G' → flows_new [E_new_i]
   Step 5 — Save results        : Output .pkl file, for use by build_network_pairs_dataset.py
 
 Strict constraints:
@@ -16,7 +16,7 @@ Strict constraints:
 Output data structure (each completed_pair is a dict):
   {
     'od_matrix'    : np.ndarray [C, C],     # shared OD (only used for SUE)
-    'G'            : nx.DiGraph,            # base scenario graph (fixed topology + LHS attributes)
+    'G'            : nx.DiGraph,            # baseline-perturbed scenario graph
     'G_prime'      : nx.DiGraph,            # mutated network
     'mutation_type': str,
     'mutation_info': dict,
@@ -28,7 +28,7 @@ Output data structure (each completed_pair is a dict):
 
 Usage:
   python solve_network_pairs.py --num_samples 2000 --network_name SiouxFalls
-  python solve_network_pairs.py --num_samples 2000 --network_name Anaheim --demand_source trips
+  python solve_network_pairs.py --num_samples 2000 --network_name Anaheim
   python solve_network_pairs.py --num_samples 2000 --network_name CustomNet --network_file path/to/net.tntp --od_file path/to/trips.tntp
   python solve_network_pairs.py --num_samples 2000 --skip_first_solve  # resume job from checkpoint
 """
@@ -37,7 +37,6 @@ import argparse
 import os
 import pickle
 import sys
-import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 
@@ -48,15 +47,14 @@ from tqdm import tqdm
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from generate_scenarios import (
-    generate_base_scenarios_from_od_matrix,
-    generate_lhs_base_scenarios,
+    generate_baseline_perturbed_scenarios,
     save_scenarios,
     load_scenarios,
     generate_network_pairs,
 )
 from network_parser import load_network_data
 from network_registry import resolve_network_spec
-from sue_solver import advanced_sue_solver, MarkovLoadingConvergenceWarning
+from sue_solver import SUEConvergenceError, markov_logit_sue_solver
 from utils import compute_free_flow_times
 
 
@@ -97,7 +95,7 @@ def _init_first_sue_worker(
 def _first_sue_worker(sample_idx: int) -> dict:
     state = _FIRST_SUE_WORKER_STATE
     try:
-        flows_i, loading_warning, used_flow_iter = _run_advanced_sue_with_loading_retry(
+        flows_i, retried, used_flow_iter = _run_markov_logit_sue_with_retry(
             G=state["G_topo"],
             od_matrix=state["od_matrices"][sample_idx],
             capacities=state["capacities"][sample_idx],
@@ -109,7 +107,7 @@ def _first_sue_worker(sample_idx: int) -> dict:
         return {
             "index": sample_idx,
             "flows": flows_i,
-            "loading_warning": bool(loading_warning),
+            "retried": bool(retried),
             "used_flow_iter": int(used_flow_iter),
             "error": "",
         }
@@ -117,7 +115,7 @@ def _first_sue_worker(sample_idx: int) -> dict:
         return {
             "index": sample_idx,
             "flows": None,
-            "loading_warning": False,
+            "retried": False,
             "used_flow_iter": int(state["solver_params"]["flow_iter"]),
             "error": repr(exc),
         }
@@ -133,21 +131,25 @@ def _init_second_sue_worker(scenario_pairs: list, solver_params: dict) -> None:
     )
 
 
-def _second_sue_worker(sample_idx: int) -> dict:
+def _second_sue_worker(pair_position: int) -> dict:
     state = _SECOND_SUE_WORKER_STATE
-    pair = state["scenario_pairs"][sample_idx]
-    G_prime = pair["G_prime"]
-    od_matrix = pair["od_matrix"]
+    pair = state["scenario_pairs"][pair_position]
+    sample_idx = int(pair.get("sample_idx", pair_position))
 
     try:
-        flows_new, loading_warning, used_flow_iter = solve_single_graph_sue(
+        G_prime = pair["G_prime"]
+        od_matrix = pair["od_matrix"]
+        flows_new, retried, used_flow_iter = solve_single_graph_sue(
             G_prime,
             od_matrix,
+            node_ids=pair.get("node_ids"),
+            centroid_nodes=pair.get("centroid_nodes"),
             **state["solver_params"],
         )
         edge_list_old = list(pair["G"].edges())
         edge_list_new = list(G_prime.edges())
         completed_pair = {
+            'sample_idx'    : sample_idx,
             'od_matrix'    : pair['od_matrix'],
             'G'            : pair['G'],
             'G_prime'      : G_prime,
@@ -165,7 +167,7 @@ def _second_sue_worker(sample_idx: int) -> dict:
         return {
             "index": sample_idx,
             "pair": completed_pair,
-            "loading_warning": bool(loading_warning),
+            "retried": bool(retried),
             "used_flow_iter": int(used_flow_iter),
             "error": "",
             "mutation_type": pair["mutation_type"],
@@ -174,7 +176,7 @@ def _second_sue_worker(sample_idx: int) -> dict:
         return {
             "index": sample_idx,
             "pair": None,
-            "loading_warning": False,
+            "retried": False,
             "used_flow_iter": int(state["solver_params"]["flow_iter"]),
             "error": repr(exc),
             "mutation_type": pair.get("mutation_type", "unknown"),
@@ -212,7 +214,7 @@ def _extract_graph_arrays(G) -> tuple:
     return edges, capacities, free_flow_times
 
 
-def _run_advanced_sue_with_loading_retry(
+def _run_markov_logit_sue_with_retry(
     G,
     od_matrix: np.ndarray,
     capacities: np.ndarray,
@@ -225,40 +227,81 @@ def _run_advanced_sue_with_loading_retry(
     flow_iter: int,
     flow_tol: float,
     retry_flow_iter: int,
-) -> tuple[np.ndarray, bool, int]:
-    """Run SUE once, and retry with a higher inner loading iteration cap if needed."""
-
-    def _solve(current_flow_iter: int) -> tuple[np.ndarray, bool]:
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always", MarkovLoadingConvergenceWarning)
-            flows = advanced_sue_solver(
+    retry_max_iter: int = 300,
+    retry_value_iter: int = 500,
+    node_ids=None,
+    centroid_nodes=None,
+    initial_flows: np.ndarray | None = None,
+    return_diagnostics: bool = False,
+    loading_protocol: str = "reasonable_links",
+    initial_flow_mode: str = "direct",
+    initial_loading_protocol: str | None = None,
+    step_rule: str = "msa_sr",
+    residual_step_exponent: float = 0.5,
+    residual_step_min: float = 0.02,
+    residual_step_max: float = 0.80,
+    stop_before_update: bool = False,
+    step_warmup_iters: int = 0,
+    step_warmup_max: float = 1.0,
+) -> tuple:
+    """Run strict Markov-logit SUE and retry one convergence failure strongly."""
+    attempts = (
+        (int(max_iter), int(value_iter), int(flow_iter)),
+        (
+            max(int(max_iter), int(retry_max_iter)),
+            max(int(value_iter), int(retry_value_iter)),
+            max(int(flow_iter), int(retry_flow_iter)),
+        ),
+    )
+    last_error = None
+    for attempt_index, (current_max_iter, current_value_iter, current_flow_iter) in enumerate(attempts):
+        try:
+            result = markov_logit_sue_solver(
                 G,
                 od_matrix,
                 capacities,
                 free_flow_times,
-                max_iter=max_iter,
+                node_ids=node_ids,
+                centroid_nodes=centroid_nodes,
+                max_iter=current_max_iter,
                 convergence_threshold=convergence_threshold,
                 verbose=False,
                 theta=theta,
-                value_iter=value_iter,
+                value_iter=current_value_iter,
                 value_tol=value_tol,
                 flow_iter=current_flow_iter,
                 flow_tol=flow_tol,
+                initial_flows=initial_flows,
+                return_diagnostics=return_diagnostics,
+                loading_protocol=loading_protocol,
+                initial_flow_mode=initial_flow_mode,
+                initial_loading_protocol=initial_loading_protocol,
+                step_rule=step_rule,
+                residual_step_exponent=residual_step_exponent,
+                residual_step_min=residual_step_min,
+                residual_step_max=residual_step_max,
+                stop_before_update=stop_before_update,
+                step_warmup_iters=step_warmup_iters,
+                step_warmup_max=step_warmup_max,
             )
+        except SUEConvergenceError as exc:
+            last_error = exc
+            if attempt_index == 0:
+                continue
+            raise
 
-        loading_warning = any(
-            issubclass(w.category, MarkovLoadingConvergenceWarning)
-            for w in caught
-        )
-        return flows, loading_warning
+        retried = attempt_index > 0
+        if return_diagnostics:
+            flows, diagnostics = result
+            diagnostics = dict(diagnostics)
+            diagnostics["retry_used"] = retried
+            diagnostics["used_max_iter"] = current_max_iter
+            diagnostics["used_value_iter"] = current_value_iter
+            diagnostics["used_flow_iter"] = current_flow_iter
+            return flows, retried, current_flow_iter, diagnostics
+        return result, retried, current_flow_iter
 
-    flows, loading_warning = _solve(flow_iter)
-    used_flow_iter = flow_iter
-    if loading_warning and retry_flow_iter > flow_iter:
-        flows, loading_warning = _solve(retry_flow_iter)
-        used_flow_iter = retry_flow_iter
-
-    return flows, loading_warning, used_flow_iter
+    raise last_error  # pragma: no cover - both attempts either return or raise
 
 
 def solve_single_graph_sue(
@@ -272,14 +315,29 @@ def solve_single_graph_sue(
     flow_iter: int = 500,
     flow_tol: float = 1e-9,
     retry_flow_iter: int = 2000,
-) -> tuple[np.ndarray, bool, int]:
+    retry_max_iter: int = 300,
+    retry_value_iter: int = 500,
+    node_ids=None,
+    centroid_nodes=None,
+    initial_flows: np.ndarray | None = None,
+    return_diagnostics: bool = False,
+    loading_protocol: str = "reasonable_links",
+    initial_flow_mode: str = "direct",
+    initial_loading_protocol: str | None = None,
+    step_rule: str = "msa_sr",
+    residual_step_exponent: float = 0.5,
+    residual_step_min: float = 0.02,
+    residual_step_max: float = 0.80,
+    stop_before_update: bool = False,
+    step_warmup_iters: int = 0,
+    step_warmup_max: float = 1.0,
+) -> tuple:
     """
-    Run Frank-Wolfe SUE solve for an arbitrary single graph G (topology/attributes).
+    Run strict Markov-logit SUE for an arbitrary graph G.
 
-    Difference from solve_sue_batch:
-    - solve_sue_batch assumes all samples share the same topology, attributes are passed in batch via numpy arrays.
-    - This function extracts capacities and free_flow_times directly from the graph's edge attributes,
-      suitable for G' (each G' may have different numbers and order of edges).
+    This function extracts capacities and free_flow_times directly from the
+    graph's edge attributes, so it supports G' instances with different edge
+    counts and edge orders.
 
     The returned flows index order matches list(G.edges()) exactly.
     Callers should save list(G.edges()) before calling in order to restore indices later.
@@ -293,15 +351,22 @@ def solve_single_graph_sue(
 
     Returns:
         flows: np.ndarray [E], equilibrium flows, indexed by list(G.edges())
-        loading_warning: whether inner Markov loading still failed after optional retry
+        retried: whether the accepted solution required the stronger second attempt
         used_flow_iter: the inner loading iteration cap used for the final solve
 
     Raises:
-        ValueError: If the solving result contains NaN or Inf (considered failed solve)
+        SUEConvergenceError: If both strict convergence attempts fail
+        ValueError: If graph metadata or numerical inputs are invalid
     """
     edges, capacities, free_flow_times = _extract_graph_arrays(G)
+    resolved_node_ids = tuple(node_ids) if node_ids is not None else tuple(sorted(G.nodes()))
+    if centroid_nodes is None:
+        raise ValueError(
+            "centroid_nodes is required; OD rows/columns cannot be inferred from node order."
+        )
+    resolved_centroids = tuple(centroid_nodes)
 
-    flows, loading_warning, used_flow_iter = _run_advanced_sue_with_loading_retry(
+    result = _run_markov_logit_sue_with_retry(
         G=G,
         od_matrix=od_matrix,
         capacities=capacities,
@@ -314,7 +379,27 @@ def solve_single_graph_sue(
         flow_iter=flow_iter,
         flow_tol=flow_tol,
         retry_flow_iter=retry_flow_iter,
+        retry_max_iter=retry_max_iter,
+        retry_value_iter=retry_value_iter,
+        node_ids=resolved_node_ids,
+        centroid_nodes=resolved_centroids,
+        initial_flows=initial_flows,
+        return_diagnostics=return_diagnostics,
+        loading_protocol=loading_protocol,
+        initial_flow_mode=initial_flow_mode,
+        initial_loading_protocol=initial_loading_protocol,
+        step_rule=step_rule,
+        residual_step_exponent=residual_step_exponent,
+        residual_step_min=residual_step_min,
+        residual_step_max=residual_step_max,
+        stop_before_update=stop_before_update,
+        step_warmup_iters=step_warmup_iters,
+        step_warmup_max=step_warmup_max,
     )
+    if return_diagnostics:
+        flows, retried, used_flow_iter, diagnostics = result
+    else:
+        flows, retried, used_flow_iter = result
 
     # Check numerical validity: NaN or Inf means divergent solve or a structural problem in the graph
     if np.any(np.isnan(flows)) or np.any(np.isinf(flows)):
@@ -322,7 +407,9 @@ def solve_single_graph_sue(
             f"SUE result contains NaN/Inf (graph has {G.number_of_edges()} edges)."
         )
 
-    return flows, loading_warning, used_flow_iter
+    if return_diagnostics:
+        return flows, retried, used_flow_iter, diagnostics
+    return flows, retried, used_flow_iter
 
 
 # ============================================================
@@ -334,6 +421,8 @@ def run_first_sue_solve(
     od_matrices: np.ndarray,
     capacities: np.ndarray,
     speeds: np.ndarray,
+    node_ids=None,
+    centroid_nodes=None,
     max_iter: int = 120,
     convergence_threshold: float = 1e-5,
     theta: float = 0.8,
@@ -342,16 +431,21 @@ def run_first_sue_solve(
     flow_iter: int = 500,
     flow_tol: float = 1e-9,
     retry_flow_iter: int = 2000,
+    retry_max_iter: int = 300,
+    retry_value_iter: int = 500,
     num_workers: int = 1,
+    loading_protocol: str = "reasonable_links",
 ) -> np.ndarray:
     """
     First SUE batch solving: compute flows_old on fixed topology G.
 
     All base scenarios share the same G_topo topology, only capacity and speed differ,
-    so the existing solve_sue_batch batch interface can be reused for efficient solving.
+    Each sample is solved independently so convergence failures can be retried
+    once and then excluded without contaminating other samples.
 
     flows_old[i] is indexed by list(G_topo.edges()) in a fixed order,
-    and will be used in generate_network_pairs to identify high-flow nodes.
+    Failed rows remain non-finite in the intermediate array and are excluded
+    before network-pair construction.
 
     Args:
         G_topo:               base topology graph (from the .tntp file, containing length attribute)
@@ -363,12 +457,13 @@ def run_first_sue_solve(
         theta:                Logit dispersion parameter
 
     Returns:
-        flows_old: np.ndarray [N, 76], indexed by list(G_topo.edges())
+        flows_old: np.ndarray [N, E], indexed by list(G_topo.edges())
+        failure_records: first-stage failures with source index and reason
     """
     num_samples = od_matrices.shape[0]
 
     print(f"\n{'='*60}")
-    print(f"Step 2 — First SUE batch solve (on G, total {num_samples} scenarios)")
+    print(f"First SUE solve on G (total {num_samples} scenarios)")
     print(f"{'='*60}")
 
     # Use utils.compute_free_flow_times to compute free flow time:
@@ -378,10 +473,10 @@ def run_first_sue_solve(
 
     edges_G = list(G_topo.edges())
     num_edges_G = len(edges_G)
-    flows_old = np.zeros((num_samples, num_edges_G), dtype=np.float64)
+    flows_old = np.full((num_samples, num_edges_G), np.nan, dtype=np.float64)
 
-    failed_count = 0
-    loading_warning_indices = []
+    failure_records = []
+    retried_indices = []
     worker_count = _normalise_num_workers(num_workers, num_samples)
     solver_params = {
         "max_iter": max_iter,
@@ -392,26 +487,31 @@ def run_first_sue_solve(
         "flow_iter": flow_iter,
         "flow_tol": flow_tol,
         "retry_flow_iter": retry_flow_iter,
+        "retry_max_iter": retry_max_iter,
+        "retry_value_iter": retry_value_iter,
+        "node_ids": tuple(node_ids) if node_ids is not None else tuple(sorted(G_topo.nodes())),
+        "centroid_nodes": tuple(centroid_nodes) if centroid_nodes is not None else None,
+        "loading_protocol": loading_protocol,
     }
     print(f"  First SUE workers: {worker_count}")
 
     def _consume_result(result: dict) -> None:
-        nonlocal failed_count
         i = int(result["index"])
         if result["error"]:
-            failed_count += 1
-            flows_old[i] = 0.0
-            if failed_count <= 5:
-                print(f"  [Warning] Scenario {i} first solve failed: {result['error']}")
+            failure_records.append(
+                {"index": i, "stage": "old_sue", "reason": result["error"]}
+            )
+            if len(failure_records) <= 5:
+                print(f"  [Skipped] Scenario {i} first solve failed: {result['error']}")
             return
 
         flows_old[i] = result["flows"]
-        if result["loading_warning"]:
-            loading_warning_indices.append(i)
-            if len(loading_warning_indices) <= 5:
+        if result["retried"]:
+            retried_indices.append(i)
+            if len(retried_indices) <= 5:
                 print(
-                    f"  [Warning] Scenario {i} kept approximate inner loading "
-                    f"after flow_iter={result['used_flow_iter']}."
+                    f"  [Retry succeeded] Scenario {i} accepted after stronger "
+                    f"Markov-logit limits (flow_iter={result['used_flow_iter']})."
                 )
 
     if worker_count == 1:
@@ -446,17 +546,20 @@ def run_first_sue_solve(
 
     print(f"\n  First SUE solve complete!")
     print(f"  flows_old shape: {flows_old.shape}")
-    print(f"  flows_old stats: min={flows_old.min():.1f}, max={flows_old.max():.1f}, "
-          f"mean={flows_old.mean():.1f}")
-    if failed_count:
-        print(f"  [Warning] First solve failed for {failed_count} scenarios (flows_old set to zero)")
-    if loading_warning_indices:
+    valid_rows = np.all(np.isfinite(flows_old), axis=1)
+    if np.any(valid_rows):
+        valid_flows = flows_old[valid_rows]
+        print(f"  valid flows_old stats: min={valid_flows.min():.1f}, max={valid_flows.max():.1f}, "
+              f"mean={valid_flows.mean():.1f}")
+    if failure_records:
+        print(f"  First solve failed for {len(failure_records)} scenarios; they will be skipped.")
+    if retried_indices:
         print(
-            f"  [Warning] First solve kept approximate inner loading for "
-            f"{len(loading_warning_indices)} scenarios: {loading_warning_indices[:10]}"
+            f"  Stronger retry was used for {len(retried_indices)} accepted scenarios: "
+            f"{retried_indices[:10]}"
         )
 
-    return flows_old
+    return flows_old, failure_records
 
 
 # ============================================================
@@ -473,9 +576,12 @@ def run_second_sue_solve(
     flow_iter: int = 500,
     flow_tol: float = 1e-9,
     retry_flow_iter: int = 2000,
+    retry_max_iter: int = 300,
+    retry_value_iter: int = 500,
     checkpoint_path: str = None,
     checkpoint_interval: int = 200,
     num_workers: int = 1,
+    loading_protocol: str = "reasonable_links",
 ) -> tuple:
     """
     Second SUE solving: solve each G' independently, then merge into final data pairs.
@@ -508,14 +614,18 @@ def run_second_sue_solve(
     num_pairs = len(scenario_pairs)
 
     print(f"\n{'='*60}")
-    print(f"Step 4 — Second SUE solve (on each G', total {num_pairs} graphs)")
+    print(f"Second SUE solve on G' (total {num_pairs} graphs)")
     print(f"{'='*60}")
+    if num_pairs == 0:
+        print("  No scenarios reached the second solve; returning an empty valid set.")
+        return [], [], []
     if checkpoint_path:
         print(f"  Checkpoint save path: {checkpoint_path} (every {checkpoint_interval} samples)")
 
     completed_by_index = {}
     failed_indices  = []
-    loading_warning_indices = []
+    failure_records = []
+    retried_indices = []
     worker_count = _normalise_num_workers(num_workers, num_pairs)
     solver_params = {
         "max_iter": max_iter,
@@ -526,6 +636,9 @@ def run_second_sue_solve(
         "flow_iter": flow_iter,
         "flow_tol": flow_tol,
         "retry_flow_iter": retry_flow_iter,
+        "retry_max_iter": retry_max_iter,
+        "retry_value_iter": retry_value_iter,
+        "loading_protocol": loading_protocol,
     }
     print(f"  Second SUE workers: {worker_count}")
 
@@ -536,6 +649,14 @@ def run_second_sue_solve(
         i = int(result["index"])
         if result["error"]:
             failed_indices.append(i)
+            failure_records.append(
+                {
+                    "index": i,
+                    "stage": "new_sue",
+                    "reason": result["error"],
+                    "mutation_type": result["mutation_type"],
+                }
+            )
             if len(failed_indices) <= 10:
                 print(
                     f"\n  [Skipped] Sample {i} "
@@ -543,12 +664,12 @@ def run_second_sue_solve(
                 )
         else:
             completed_by_index[i] = result["pair"]
-            if result["loading_warning"]:
-                loading_warning_indices.append(i)
-                if len(loading_warning_indices) <= 5:
+            if result["retried"]:
+                retried_indices.append(i)
+                if len(retried_indices) <= 5:
                     print(
-                        f"\n  [Warning] Sample {i} kept approximate inner loading "
-                        f"after flow_iter={result['used_flow_iter']}."
+                        f"\n  [Retry succeeded] Sample {i} accepted after stronger "
+                        f"Markov-logit limits (flow_iter={result['used_flow_iter']})."
                     )
 
         if (checkpoint_path is not None
@@ -600,10 +721,10 @@ def run_second_sue_solve(
 
     if failed_indices:
         print(f"  Failed sample indices (first 20): {failed_indices[:20]}")
-    if loading_warning_indices:
+    if retried_indices:
         print(
-            f"  [Warning] Second solve kept approximate inner loading for "
-            f"{len(loading_warning_indices)} samples: {loading_warning_indices[:20]}"
+            f"  Stronger retry was used for {len(retried_indices)} accepted samples: "
+            f"{retried_indices[:20]}"
         )
 
     # Print true distribution of mutation types in finished samples
@@ -614,7 +735,7 @@ def run_second_sue_solve(
         for t, cnt in sorted(dist.items()):
             print(f"    {t:20s}: {cnt:5d} ({cnt/success*100:.1f}%)")
 
-    return completed_pairs, failed_indices
+    return completed_pairs, failed_indices, failure_records
 
 
 def _save_checkpoint(completed_pairs: list, failed_indices: list,
@@ -649,9 +770,9 @@ def run_pipeline(args) -> list:
 
     Execution order:
       Step 1 — Load base topology
-      Step 2 — LHS sample base scenarios (or load from file)
+      Step 2 — Generate baseline-preserving perturbations (or load them)
       Step 3 — First SUE batch solve (or load flows_old from file)
-      Step 4 — Generate (G, G') network pairs (pass in flows_old to locate high-flow nodes)
+      Step 4 — Generate one flow-independent reconfiguration for each G
       Step 5 — Second SUE solve for each graph (G' topologies vary, each solved individually)
       Step 6 — Save final dataset
 
@@ -672,7 +793,6 @@ def run_pipeline(args) -> list:
         od_file=args.od_file,
         parser=args.parser,
         node_id_offset=args.node_id_offset,
-        demand_source=args.demand_source,
         centroid_nodes=args.centroid_nodes,
     )
     network_data = load_network_data(network_spec)
@@ -685,7 +805,7 @@ def run_pipeline(args) -> list:
     centroids = list(network_data.centroid_nodes)
     edges_G_topo = list(G_topo.edges())
     num_edges_G = len(edges_G_topo)
-    od_dim = network_data.od_dim if network_data.od_matrix is not None else len(centroids)
+    od_dim = network_data.od_dim
     if od_dim <= 0:
         raise ValueError(
             "Failed to infer OD dimension. Provide a valid OD file or explicit centroid_nodes."
@@ -695,10 +815,7 @@ def run_pipeline(args) -> list:
     print(f"  Centroids:   {centroids if centroids else 'inferred from OD dimension'}")
     print(f"  OD dimension: {od_dim}")
     print(f"  Network file: {network_spec.network_file}")
-    if network_spec.od_file and os.path.exists(network_spec.od_file):
-        print(f"  OD file:      {network_spec.od_file}")
-    elif network_spec.demand_source == 'trips':
-        print(f"  OD file:      {network_spec.od_file} (required, currently missing)")
+    print(f"  OD file:      {network_spec.od_file}")
 
     # ---- Step 2: Base scenario generation ----
     scenarios_path = os.path.join(args.output_dir, 'base_scenarios.npz')
@@ -710,25 +827,52 @@ def run_pipeline(args) -> list:
         od_matrices, capacities, speeds = load_scenarios(scenarios_path)
     else:
         print(f"\n{'='*60}")
-        print(f"Step 2 — Generate base scenarios ({network_spec.demand_source})")
+        print("Step 2 — Generate baseline-preserving perturbed scenarios")
         print(f"{'='*60}")
-        if network_spec.demand_source == 'trips':
-            if network_data.od_matrix is None:
-                raise ValueError("demand_source='trips' requires a valid OD trips file.")
-            od_matrices, capacities, speeds = generate_base_scenarios_from_od_matrix(
-                base_od_matrix=network_data.od_matrix,
-                num_samples=args.num_samples,
-                num_edges=num_edges_G,
-                seed=args.seed,
-            )
-        else:
-            od_matrices, capacities, speeds = generate_lhs_base_scenarios(
-                num_samples=args.num_samples,
-                num_centroids=od_dim,
-                num_edges=num_edges_G,
-                seed=args.seed,
-            )
+        od_matrices, capacities, speeds = generate_baseline_perturbed_scenarios(
+            base_od_matrix=network_data.od_matrix,
+            baseline_graph=G_topo,
+            num_samples=args.num_samples,
+            seed=args.seed,
+        )
         save_scenarios(od_matrices, capacities, speeds, scenarios_path)
+
+    expected_shapes = (
+        (args.num_samples, od_dim, od_dim),
+        (args.num_samples, num_edges_G),
+        (args.num_samples, num_edges_G),
+    )
+    actual_shapes = (od_matrices.shape, capacities.shape, speeds.shape)
+    if actual_shapes != expected_shapes:
+        raise ValueError(
+            f"Scenario archive shapes {actual_shapes} do not match expected {expected_shapes}."
+        )
+    if not all(np.all(np.isfinite(arr)) for arr in (od_matrices, capacities, speeds)):
+        raise ValueError("Scenario archive contains NaN or Inf.")
+    if np.any(capacities <= 0.0) or np.any(speeds <= 0.0):
+        raise ValueError("Scenario archive contains non-positive capacity or speed.")
+    baseline_capacities = np.asarray(
+        [G_topo[u][v]["capacity"] for u, v in edges_G_topo], dtype=np.float64
+    )
+    baseline_speeds = np.asarray(
+        [G_topo[u][v]["speed"] for u, v in edges_G_topo], dtype=np.float64
+    )
+    baseline_zero_mask = network_data.od_matrix == 0.0
+    for sample_idx, od_matrix in enumerate(od_matrices):
+        if np.any(od_matrix[baseline_zero_mask] != 0.0) or np.any(np.diag(od_matrix) != 0.0):
+            raise ValueError(
+                f"Scenario {sample_idx} does not preserve baseline OD sparsity/zero diagonal."
+            )
+        capacity_ratio = capacities[sample_idx] / baseline_capacities
+        speed_ratio = speeds[sample_idx] / baseline_speeds
+        if np.any(capacity_ratio < 0.90 - 1e-12) or np.any(capacity_ratio > 1.10 + 1e-12):
+            raise ValueError(
+                f"Scenario {sample_idx} capacity is outside the baseline multiplier [0.90, 1.10]."
+            )
+        if np.any(speed_ratio < 0.95 - 1e-12) or np.any(speed_ratio > 1.05 + 1e-12):
+            raise ValueError(
+                f"Scenario {sample_idx} speed is outside the baseline multiplier [0.95, 1.05]."
+            )
 
     # ---- Step 3: First SUE batch solve ----
     flows_old_path = os.path.join(args.output_dir, 'flows_old.npy')
@@ -743,8 +887,10 @@ def run_pipeline(args) -> list:
         print(f"\n{'='*60}")
         print("Step 3 — First SUE batch solve")
         print(f"{'='*60}")
-        flows_old = run_first_sue_solve(
+        flows_old, first_failure_records = run_first_sue_solve(
             G_topo, od_matrices, capacities, speeds,
+            node_ids=network_data.node_ids,
+            centroid_nodes=network_data.centroid_nodes,
             max_iter=args.max_iter,
             convergence_threshold=args.convergence_threshold,
             theta=args.theta,
@@ -753,22 +899,41 @@ def run_pipeline(args) -> list:
             flow_iter=args.flow_iter,
             flow_tol=args.flow_tol,
             retry_flow_iter=args.retry_flow_iter,
+            retry_max_iter=args.retry_max_iter,
+            retry_value_iter=args.retry_value_iter,
             num_workers=args.num_workers,
+            loading_protocol=args.sue_loading_protocol,
         )
         np.save(flows_old_path, flows_old)
         print(f"  flows_old saved: {flows_old_path}")
+
+    if args.skip_first_solve and os.path.exists(flows_old_path):
+        if flows_old.shape != (args.num_samples, num_edges_G):
+            raise ValueError(
+                f"flows_old shape {flows_old.shape} does not match "
+                f"({args.num_samples}, {num_edges_G})."
+            )
+        first_failure_records = []
+        for sample_idx, row in enumerate(flows_old):
+            if (not np.all(np.isfinite(row)) or np.any(row < 0.0)
+                    or (od_matrices[sample_idx].sum() > 0.0 and row.sum() <= 0.0)):
+                first_failure_records.append(
+                    {
+                        "index": sample_idx,
+                        "stage": "old_sue",
+                        "reason": "Loaded flows_old row is invalid or non-converged.",
+                    }
+                )
 
     # ---- Step 4: Generate (G, G') network pairs ----
     print(f"\n{'='*60}")
     print("Step 4 — Generate (G, G') network pairs")
     print(f"{'='*60}")
-    # Inject flows_old into generate_network_pairs for high-flow node identification (add-edge mutations depend on this info)
-    scenario_pairs = generate_network_pairs(
+    scenario_pairs, mutation_failure_records = generate_network_pairs(
         G_topo=G_topo,
         od_matrices=od_matrices,
         capacities=capacities,
         speeds=speeds,
-        flows_old=flows_old,
         seed=args.seed,
         network_name=network_data.network_name,
         node_ids=network_data.node_ids,
@@ -780,14 +945,20 @@ def run_pipeline(args) -> list:
     # Embed the first-solve flows_old[i] into each pair for unified access in subsequent steps
     # Note: flows_old[i] uses list(G_topo.edges()) as index,
     # which matches exactly the edge order of pair['G'] (build_scenario_graph doesn't change edge order)
-    for i, pair in enumerate(scenario_pairs):
-        pair['flows_old'] = flows_old[i].copy()
+    first_failed = {int(record["index"]) for record in first_failure_records}
+    ready_pairs = []
+    for pair in scenario_pairs:
+        sample_idx = int(pair["sample_idx"])
+        if sample_idx in first_failed:
+            continue
+        pair['flows_old'] = flows_old[sample_idx].copy()
+        ready_pairs.append(pair)
 
     # ---- Step 5: Second SUE solve per graph ----
     checkpoint_path = os.path.join(args.output_dir, 'pairs_completed.pkl')
 
-    completed_pairs, failed_indices = run_second_sue_solve(
-        scenario_pairs=scenario_pairs,
+    completed_pairs, failed_indices, second_failure_records = run_second_sue_solve(
+        scenario_pairs=ready_pairs,
         max_iter=args.max_iter,
         convergence_threshold=args.convergence_threshold,
         theta=args.theta,
@@ -796,9 +967,12 @@ def run_pipeline(args) -> list:
         flow_iter=args.flow_iter,
         flow_tol=args.flow_tol,
         retry_flow_iter=args.retry_flow_iter,
+        retry_max_iter=args.retry_max_iter,
+        retry_value_iter=args.retry_value_iter,
         checkpoint_path=checkpoint_path if args.checkpoint else None,
         checkpoint_interval=args.checkpoint_interval,
         num_workers=args.num_workers,
+        loading_protocol=args.sue_loading_protocol,
     )
 
     # ---- Step 6: Save final dataset ----
@@ -807,7 +981,23 @@ def run_pipeline(args) -> list:
     print(f"{'='*60}")
 
     output_path = os.path.join(args.output_dir, 'network_pairs_dataset.pkl')
-    _save_final_dataset(completed_pairs, failed_indices, output_path)
+    failed_indices = sorted(
+        set(failed_indices)
+        | first_failed
+        | {int(record["index"]) for record in mutation_failure_records}
+    )
+    failure_records = list(first_failure_records)
+    failure_records.extend(
+        {"stage": "reconfiguration", **record}
+        for record in mutation_failure_records
+    )
+    failure_records.extend(second_failure_records)
+    _save_final_dataset(
+        completed_pairs,
+        failed_indices,
+        output_path,
+        failure_records=failure_records,
+    )
 
     # Print final summary
     _print_final_summary(completed_pairs, failed_indices, output_path, args)
@@ -816,13 +1006,14 @@ def run_pipeline(args) -> list:
 
 
 def _save_final_dataset(completed_pairs: list, failed_indices: list,
-                        output_path: str) -> None:
+                        output_path: str, failure_records: list | None = None) -> None:
     """
     Persist the full dataset to a pickle file.
 
     The file contains two fields:
       - 'pairs'          : list of dict, the complete list of (G, G') data pairs
       - 'failed_indices' : list of int, indices of failed samples (for auditing)
+      - 'failure_records': stage and reason for each recorded failure
 
     Args:
         completed_pairs: The list of completed data pairs
@@ -833,6 +1024,7 @@ def _save_final_dataset(completed_pairs: list, failed_indices: list,
     payload = {
         'pairs'         : completed_pairs,
         'failed_indices': failed_indices,
+        'failure_records': list(failure_records or []),
     }
     with open(output_path, 'wb') as f:
         pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
@@ -892,16 +1084,13 @@ def parse_args():
     parser.add_argument('--network_file', type=str, default='',
                         help='Path to network file (.tntp). Overrides the preset if provided.')
     parser.add_argument('--od_file', type=str, default='',
-                        help='Path to OD / trips file (.tntp). Optional when demand_source=lhs.')
+                        help='Path to the required baseline OD / trips file (.tntp).')
     parser.add_argument('--parser', type=str, default='tntp',
                         help='Raw file parser type')
     parser.add_argument('--node_id_offset', type=int, default=1,
                         help='Raw node id base offset used by the parser')
     parser.add_argument('--centroid_nodes', type=str, default='',
                         help='Optional explicit centroid node ids, comma separated')
-    parser.add_argument('--demand_source', type=str, default='lhs',
-                        choices=['lhs', 'trips'],
-                        help='How to build OD matrices: sample with LHS or repeat parsed trips OD')
     parser.add_argument('--num_samples', type=int, default=2000,
                         help='Number of scenario pairs to generate')
     parser.add_argument('--seed', type=int, default=42,
@@ -926,9 +1115,23 @@ def parse_args():
     parser.add_argument('--flow_tol', type=float, default=1e-9,
                         help='Inner Markov loading tolerance')
     parser.add_argument('--retry_flow_iter', type=int, default=2000,
-                        help='Retry inner Markov loading with this iteration cap when warning occurs; set <= flow_iter to disable')
+                        help='Stronger retry inner Markov loading iteration cap')
+    parser.add_argument('--retry_max_iter', type=int, default=300,
+                        help='Stronger retry outer Markov-logit iteration cap')
+    parser.add_argument('--retry_value_iter', type=int, default=500,
+                        help='Stronger retry recursive-logit value iteration cap')
     parser.add_argument('--num_workers', type=int, default=1,
                         help='Number of worker processes for scenario-level SUE parallelism')
+    parser.add_argument(
+        '--sue_loading_protocol',
+        type=str,
+        default='reasonable_links',
+        choices=['stable_unrestricted', 'reasonable_links', 'legacy_unrestricted'],
+        help=(
+            'Markov loading protocol. reasonable_links preserves the existing '
+            'destination-specific recursive-logit choice set used for generated labels.'
+        ),
+    )
 
     # Resume job support
     parser.add_argument('--skip_first_solve', action='store_true',

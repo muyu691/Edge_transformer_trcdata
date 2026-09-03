@@ -7,6 +7,7 @@
 # Single dataset:
 #   sbatch --array=0 scripts/run_old_flow_mean_baseline.sh  # Sioux Falls
 #   sbatch --array=1 scripts/run_old_flow_mean_baseline.sh  # EMA
+#   sbatch --array=2 scripts/run_old_flow_mean_baseline.sh  # Anaheim
 
 #SBATCH -J old_mean_base
 #SBATCH -o logs/old_mean_base_%A_%a.out
@@ -15,8 +16,9 @@
 #SBATCH -n 1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
+#SBATCH -A NA
 #SBATCH -p cpu
-#SBATCH --array=0-1
+#SBATCH --array=0-2
 
 set -euo pipefail
 
@@ -33,7 +35,7 @@ NUM_WORKERS="${NUM_WORKERS:-0}"
 DEVICE_VALUE="${DEVICE_VALUE:-cpu}"
 SEED="${SEED:-0}"
 
-DATASETS=(siouxfalls ema)
+DATASETS=(siouxfalls ema anaheim)
 TASK_ID="${SLURM_ARRAY_TASK_ID:-0}"
 DATASET_NAME="${DATASETS[$TASK_ID]}"
 
@@ -47,6 +49,11 @@ case "${DATASET_NAME}" in
     NETWORK_NAME="EMA"
     DATASET_DIR="${PROCESSED_ROOT}/ema_pyg_newpolicy_lhs"
     RUN_DIR="${OUTPUT_ROOT}/old_flow_mean_ema_10000"
+    ;;
+  anaheim)
+    NETWORK_NAME="Anaheim"
+    DATASET_DIR="${PROCESSED_ROOT}/anaheim_pyg_newpolicy_lhs"
+    RUN_DIR="${OUTPUT_ROOT}/old_flow_mean_anaheim_10000"
     ;;
   *)
     echo "Unsupported DATASET_NAME=${DATASET_NAME}" >&2

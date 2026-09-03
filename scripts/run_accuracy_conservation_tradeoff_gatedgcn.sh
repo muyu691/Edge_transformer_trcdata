@@ -60,12 +60,12 @@ SAFE_LAMBDA="${LAMBDA_CON//./p}"
 
 if [[ "${DATASET_NAME}" == "siouxfalls" ]]; then
   NETWORK_NAME="SiouxFalls"
-  DATASET_DIR="${PROCESSED_ROOT}/siouxfalls_pyg_newpolicy_lhs"
+  DATASET_DIR="${PROCESSED_ROOT}/siouxfalls_pyg_baseline_perturb"
   LAMBDA_NEW_FINAL="1.0"
   LAMBDA_CON_SCHEDULE="constant"
 elif [[ "${DATASET_NAME}" == "ema" ]]; then
   NETWORK_NAME="EMA"
-  DATASET_DIR="${PROCESSED_ROOT}/ema_pyg_newpolicy_lhs"
+  DATASET_DIR="${PROCESSED_ROOT}/ema_pyg_baseline_perturb"
   LAMBDA_NEW_FINAL="1.5"
   LAMBDA_CON_SCHEDULE="staged_linear"
 else

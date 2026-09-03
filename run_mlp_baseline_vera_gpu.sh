@@ -8,7 +8,7 @@
 #   DATASET_NAME=siouxfalls sbatch run_mlp_baseline_vera_gpu.sh
 #
 # Use an explicit processed dataset directory:
-#   DATASET_DIR=/cephyr/users/wuxin/Vera/Physics-Informed_Diffusion_Model-main/Network_reconfiguration-main/create_sioux_data/processed_data/ema_pyg_newpolicy_lhs \
+#   DATASET_DIR=/cephyr/users/wuxin/Vera/Physics-Informed_Diffusion_Model-main/Network_reconfiguration-main/create_sioux_data/processed_data/ema_pyg_baseline_perturb \
 #   sbatch run_mlp_baseline_vera_gpu.sh
 
 #SBATCH -J base_mlp

@@ -1,6 +1,4 @@
-"""
-Utility functions for Sioux Falls dataset creation
-"""
+"""Utility functions for traffic-network dataset creation."""
 
 import numpy as np
 import torch
@@ -33,51 +31,6 @@ def compute_free_flow_times(G, speeds):
         free_flow_times[:, i] = (length / speeds[:, i]) * 60
     
     return free_flow_times
-
-
-def get_edge_index_from_graph(G):
-    """
-    Convert NetworkX graph to PyTorch Geometric edge_index format.
-    
-    Args:
-        G: NetworkX DiGraph
-    
-    Returns:
-        edge_index: [2, num_edges] numpy array
-    """
-    edges = list(G.edges())
-    # Convert node IDs (1-indexed) to 0-indexed
-    edge_index = np.array([[u-1, v-1] for u, v in edges]).T
-    return edge_index
-
-
-def validate_data_shapes(od_matrices, capacities, speeds, flows=None):
-    """
-    Validate that all data arrays have consistent shapes.
-    """
-    num_samples = od_matrices.shape[0]
-    
-    print(f"\n{'='*60}")
-    print("Validating data shapes")
-    print(f"{'='*60}")
-    
-    print(f"  Number of samples: {num_samples}")
-    print(f"  OD matrices shape: {od_matrices.shape} (expected: [{num_samples}, 11, 11])")
-    print(f"  Capacities shape: {capacities.shape} (expected: [{num_samples}, 76])")
-    print(f"  Speeds shape: {speeds.shape} (expected: [{num_samples}, 76])")
-    
-    if flows is not None:
-        print(f"  Flows shape: {flows.shape} (expected: [{num_samples}, 76])")
-    
-    # Check shapes
-    assert od_matrices.shape == (num_samples, 11, 11), "OD matrices shape mismatch"
-    assert capacities.shape == (num_samples, 76), "Capacities shape mismatch"
-    assert speeds.shape == (num_samples, 76), "Speeds shape mismatch"
-    
-    if flows is not None:
-        assert flows.shape == (num_samples, 76), "Flows shape mismatch"
-    
-    print(f"\n All shapes validated successfully!")
 
 
 def check_for_nans_and_infs(data_dict):

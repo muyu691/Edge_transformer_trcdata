@@ -1,5 +1,3 @@
-"""ST-PINN diffusion backbone for traffic topology reconfiguration."""
-
 from __future__ import annotations
 
 import torch

@@ -27,7 +27,7 @@ class TrafficNetworkData:
     node_ids: Tuple[int, ...]
     centroid_nodes: Tuple[int, ...]
     metadata: Dict[str, str]
-    od_matrix: Optional[np.ndarray]
+    od_matrix: np.ndarray
     node_id_offset: int
     dataset_root: str
     network_file: str
@@ -43,7 +43,7 @@ class TrafficNetworkData:
 
     @property
     def od_dim(self) -> int:
-        return 0 if self.od_matrix is None else int(self.od_matrix.shape[0])
+        return int(self.od_matrix.shape[0])
 
 
 def _parse_metadata(lines) -> Dict[str, str]:
@@ -192,27 +192,25 @@ def _infer_centroid_nodes(
     spec: NetworkSpec,
     node_ids: Tuple[int, ...],
     metadata: Dict[str, str],
-    od_matrix: Optional[np.ndarray],
+    od_matrix: np.ndarray,
 ) -> Tuple[int, ...]:
     if spec.centroid_nodes is not None:
         return tuple(spec.centroid_nodes)
 
-    if od_matrix is not None:
-        return tuple(node_ids[: int(od_matrix.shape[0])])
-
     first_thru_node = int(metadata.get("first_thru_node", "0") or 0)
-    if first_thru_node > spec.node_id_offset:
-        return tuple(node_id for node_id in node_ids if node_id < first_thru_node)
+    if first_thru_node:
+        inferred = tuple(node_id for node_id in node_ids if node_id < first_thru_node)
+        if len(inferred) == od_matrix.shape[0]:
+            return inferred
 
-    number_of_zones = int(metadata.get("number_of_zones", "0") or 0)
-    if number_of_zones > 0:
-        return tuple(node_ids[: min(number_of_zones, len(node_ids))])
-
-    return tuple()
+    raise ValueError(
+        "Cannot infer centroid_nodes safely from this TNTP network. "
+        "Configure explicit centroid node ids instead of assuming the first OD-sized node block."
+    )
 
 
 def load_network_data(spec: NetworkSpec) -> TrafficNetworkData:
-    """Load network and optional OD metadata from a resolved network spec."""
+    """Load a network and its required baseline OD matrix from a resolved spec."""
     parser = spec.parser.lower()
     if parser != "tntp":
         raise ValueError(f"Unsupported parser='{spec.parser}'. Only 'tntp' is implemented.")
@@ -220,14 +218,28 @@ def load_network_data(spec: NetworkSpec) -> TrafficNetworkData:
     graph, metadata = parse_tntp_network(spec.network_file, node_id_offset=spec.node_id_offset)
     node_ids = tuple(sorted(graph.nodes()))
 
-    od_matrix = None
-    if spec.od_file:
-        if os.path.exists(spec.od_file):
-            od_matrix = parse_tntp_trips(spec.od_file)
-        elif spec.demand_source == "trips":
-            raise FileNotFoundError(f"Trips file not found: {spec.od_file}")
+    if not spec.od_file:
+        raise FileNotFoundError(
+            f"No baseline TNTP trips file configured for network '{spec.network_name}'."
+        )
+    od_matrix = parse_tntp_trips(spec.od_file)
 
     centroid_nodes = _infer_centroid_nodes(spec, node_ids, metadata, od_matrix)
+    if od_matrix.ndim != 2 or od_matrix.shape[0] != od_matrix.shape[1]:
+        raise ValueError(f"OD matrix must be square, got shape={od_matrix.shape}.")
+    if len(centroid_nodes) != od_matrix.shape[0]:
+        raise ValueError(
+            f"Centroid count {len(centroid_nodes)} does not match OD dimension "
+            f"{od_matrix.shape[0]} for network '{spec.network_name}'."
+        )
+    if len(set(centroid_nodes)) != len(centroid_nodes):
+        raise ValueError(f"Duplicate centroid node ids configured for network '{spec.network_name}'.")
+    unknown_centroids = [node_id for node_id in centroid_nodes if node_id not in graph]
+    if unknown_centroids:
+        raise ValueError(
+            f"Centroid nodes are absent from network '{spec.network_name}': "
+            f"{unknown_centroids[:10]}"
+        )
 
     return TrafficNetworkData(
         network_name=spec.network_name,

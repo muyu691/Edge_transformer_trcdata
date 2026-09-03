@@ -20,7 +20,6 @@ dataset:
   processed_root: create_sioux_data/processed_data
   node_id_offset: 1
   centroid_nodes: ''
-  demand_source: lhs
   num_nodes: 0
   num_edges_old: 0
   num_edges_new: 0

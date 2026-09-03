@@ -19,8 +19,6 @@ def dataset_cfg(cfg):
     cfg.dataset.processed_root = ""
     cfg.dataset.node_id_offset = 1
     cfg.dataset.centroid_nodes = ""
-    cfg.dataset.demand_source = "lhs"
-
     cfg.dataset.num_nodes = 0
     cfg.dataset.num_edges_old = 0
     cfg.dataset.num_edges_new = 0

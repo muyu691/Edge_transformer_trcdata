@@ -16,10 +16,13 @@ resolve_ablation_dataset_dir() {
 
   case "${dataset_key}" in
     ema)
-      printf '%s\n' "${PROCESSED_ROOT}/ema_pyg_newpolicy_lhs"
+      printf '%s\n' "${PROCESSED_ROOT}/ema_pyg_baseline_perturb"
       ;;
     siouxfalls|sioux_falls|sioux-falls)
-      printf '%s\n' "${PROCESSED_ROOT}/siouxfalls_pyg_newpolicy_lhs"
+      printf '%s\n' "${PROCESSED_ROOT}/siouxfalls_pyg_baseline_perturb"
+      ;;
+    anaheim)
+      printf '%s\n' "${PROCESSED_ROOT}/anaheim_pyg_baseline_perturb"
       ;;
     *)
       printf '%s\n' "${PROCESSED_ROOT}"
@@ -86,7 +89,7 @@ set_ablation_main_hparams() {
     siouxfalls|sioux_falls|sioux-falls)
       LAMBDA_NEW_FINAL="${LAMBDA_NEW_FINAL:-1.0}"
       LAMBDA_CON="${LAMBDA_CON:-0.1}"
-      LAMBDA_CON_SCHEDULE="${LAMBDA_CON_SCHEDULE:-constant}"
+      LAMBDA_CON_SCHEDULE="${LAMBDA_CON_SCHEDULE:-staged_linear}"
       LAMBDA_CON_MID="${LAMBDA_CON_MID:-0.01}"
       ;;
     ema)

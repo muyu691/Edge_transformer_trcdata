@@ -1,5 +1,5 @@
 #!/bin/bash
-# GPU Slurm launcher for the no-rho-injection ablation on Vera.
+# GPU Slurm launcher for the Edge Transformer no-rho-injection ablation on Vera.
 
 #SBATCH -J abl_norho
 #SBATCH -o logs/abl_norho_%j.out
@@ -8,8 +8,9 @@
 #SBATCH -n 1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64G
+#SBATCH -A NA
 #SBATCH -p gpu
-#SBATCH --gres=gpu:A40:1
+#SBATCH --gres=gpu:H100:1
 
 set -euo pipefail
 
@@ -34,7 +35,7 @@ EPOCHS="${EPOCHS:-200}"
 LR_VALUE="${LR_VALUE:-0.001}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-1e-5}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${PROJECT_ROOT}/results/ablation}"
-RUN_TAG="${RUN_TAG:-no_rho_injection_${DATASET_NAME}}"
+RUN_TAG="${RUN_TAG:-ablation_no_rho_injection_${DATASET_NAME}_10000}"
 
 set_ablation_main_hparams
 RESOLVED_DATASET_DIR="$(resolve_ablation_dataset_dir)"
@@ -42,15 +43,22 @@ NETWORK_NAME="$(resolve_ablation_network_name)"
 
 cd "${PROJECT_ROOT}"
 
-echo "=============== No Rho Injection (Vera GPU) ================"
+if [[ ! -f "${RESOLVED_DATASET_DIR}/dataset_meta.json" ]]; then
+  echo "Missing processed dataset: ${RESOLVED_DATASET_DIR}/dataset_meta.json" >&2
+  echo "Set DATASET_DIR explicitly, or generate the ${DATASET_NAME} PyG dataset first." >&2
+  exit 1
+fi
+
+echo "========== Edge Transformer No Rho Injection (Vera GPU) =========="
 echo "DATASET_NAME   : ${DATASET_NAME}"
 echo "NETWORK_NAME   : ${NETWORK_NAME}"
 echo "DATASET_DIR    : ${RESOLVED_DATASET_DIR}"
 echo "LAMBDA_NEW     : ${LAMBDA_NEW_FINAL}"
 echo "LAMBDA_CON     : ${LAMBDA_CON}"
+echo "CON_SCHEDULE   : ${LAMBDA_CON_SCHEDULE}"
 echo "RUN_TAG        : ${RUN_TAG}"
 echo "START_TIME     : $(date '+%Y-%m-%d %H:%M:%S')"
-echo "============================================================"
+echo "================================================================="
 
 source "${PROJECT_ROOT}/scripts/activate_venv_cuda.sh"
 
@@ -79,14 +87,15 @@ srun python main.py \
   topology_gnn.dropout 0.1 \
   topology_gnn.residual True \
   topology_gnn.num_heads 4 \
-  topology_gnn.local_backbone "gatedgcn" \
+  topology_gnn.local_backbone "edge_transformer" \
+  topology_gnn.num_edge_transformer_layers 1 \
   topology_gnn.ffn_type "swiglu" \
   topology_gnn.ffn_mult "8/3" \
   topology_gnn.norm_type "rmsnorm" \
   topology_gnn.norm_position "pre" \
   topology_gnn.edge_to_node_agg "mean" \
   topology_gnn.edge_endpoint_mode "fusion" \
-  topology_gnn.enable_global_attn True \
+  topology_gnn.enable_global_attn False \
   topology_gnn.init_scheme "default" \
   topology_gnn.init_residual_scale 0.1 \
   topology_gnn.init_delta_scale 0.1 \

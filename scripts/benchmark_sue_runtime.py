@@ -40,11 +40,17 @@ DATASET_PKLS = {
     / "processed_data"
     / "ema_pairs_newpolicy_lhs"
     / "network_pairs_dataset.pkl",
+    "anaheim": PROJECT_ROOT
+    / "create_sioux_data"
+    / "processed_data"
+    / "anaheim_pairs_newpolicy_lhs"
+    / "network_pairs_dataset.pkl",
 }
 
 DISPLAY_NAMES = {
     "siouxfalls": "SiouxFalls",
     "ema": "EMA",
+    "anaheim": "Anaheim",
 }
 
 
@@ -80,11 +86,19 @@ def load_pairs(input_pkl: Path) -> list[dict[str, Any]]:
     with input_pkl.open("rb") as handle:
         payload = pickle.load(handle)
     if isinstance(payload, dict):
-        pairs = payload.get("pairs")
+        if "pairs" in payload:
+            pairs = payload.get("pairs")
+        elif "completed_pairs" in payload:
+            pairs = payload.get("completed_pairs")
+        else:
+            pairs = None
     else:
         pairs = payload
     if not isinstance(pairs, list):
-        raise ValueError(f"Could not read pairs from {input_pkl}")
+        raise ValueError(
+            f"Could not read pairs from {input_pkl}. Expected a list, "
+            "a {'pairs': ...} dataset, or a {'completed_pairs': ...} checkpoint."
+        )
     return pairs
 
 
@@ -116,10 +130,47 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if not rows:
         raise ValueError(f"No rows to write for {path}")
-    with path.open("w", newline="", encoding="utf-8") as handle:
+    tmp_path = path.with_name(f"{path.name}.tmp")
+    with tmp_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
         writer.writeheader()
         writer.writerows(rows)
+    os.replace(tmp_path, path)
+
+
+def _to_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "y"}
+
+
+def read_csv_records(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    with path.open("r", newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        rows = []
+        for row in reader:
+            rows.append(
+                {
+                    "network_name": row["network_name"],
+                    "rank": int(row["rank"]),
+                    "pair_index": int(row["pair_index"]),
+                    "num_edges": int(row["num_edges"]),
+                    "elapsed_sec": float(row["elapsed_sec"]),
+                    "elapsed_ms": float(row["elapsed_ms"]),
+                    "status": row["status"],
+                    "loading_warning": _to_bool(row["loading_warning"]),
+                    "used_flow_iter": int(row["used_flow_iter"]),
+                    "flow_sum": float(row["flow_sum"]),
+                    "error": row.get("error", ""),
+                }
+            )
+    return rows
+
+
+def sort_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(records, key=lambda row: (int(row["rank"]), int(row["pair_index"])))
 
 
 def benchmark(args: argparse.Namespace) -> dict[str, Any]:
@@ -138,6 +189,9 @@ def benchmark(args: argparse.Namespace) -> dict[str, Any]:
     output_dir = Path(args.output_dir).expanduser().resolve()
     network_display = DISPLAY_NAMES[dataset_key]
     run_name = args.run_name or f"{dataset_key}_sue_runtime"
+    per_graph_csv = output_dir / f"{run_name}_per_graph.csv"
+    summary_json = output_dir / f"{run_name}_summary.json"
+    summary_csv = output_dir / f"{run_name}_summary.csv"
 
     print("=" * 72)
     print("SUE Runtime Benchmark")
@@ -159,8 +213,28 @@ def benchmark(args: argparse.Namespace) -> dict[str, Any]:
     if args.num_test_graphs > 0:
         test_idx = test_idx[: args.num_test_graphs]
 
+    target_pair_indices = {int(pair_idx) for pair_idx in test_idx}
     records: list[dict[str, Any]] = []
+    if args.resume:
+        existing_records = [
+            row
+            for row in read_csv_records(per_graph_csv)
+            if int(row["pair_index"]) in target_pair_indices
+        ]
+        if existing_records:
+            records.extend(existing_records)
+            print(
+                f"Resuming from {per_graph_csv}: "
+                f"{len(existing_records)} existing records loaded."
+            )
+
+    completed_pair_indices = {int(row["pair_index"]) for row in records}
+    new_records_since_checkpoint = 0
+
     for rank, pair_idx in enumerate(test_idx, start=1):
+        if int(pair_idx) in completed_pair_indices:
+            continue
+
         pair = pairs[int(pair_idx)]
         graph = pair["G_prime"]
         od_matrix = pair["od_matrix"]
@@ -177,6 +251,8 @@ def benchmark(args: argparse.Namespace) -> dict[str, Any]:
             flows, loading_warning, used_flow_iter = solve_single_graph_sue(
                 graph,
                 od_matrix,
+                node_ids=pair.get("node_ids"),
+                centroid_nodes=pair.get("centroid_nodes"),
                 max_iter=args.max_iter,
                 convergence_threshold=args.convergence_threshold,
                 theta=args.theta,
@@ -207,6 +283,8 @@ def benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 "error": error,
             }
         )
+        completed_pair_indices.add(int(pair_idx))
+        new_records_since_checkpoint += 1
 
         if rank == 1 or rank % args.print_every == 0 or rank == len(test_idx):
             ok_times = [r["elapsed_sec"] for r in records if r["status"] == "ok"]
@@ -215,6 +293,19 @@ def benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 f"[{rank:>5d}/{len(test_idx)}] "
                 f"last={elapsed_sec:.3f}s mean_ok={mean_msg:.3f}s status={status}"
             )
+
+        if (
+            args.checkpoint_every > 0
+            and new_records_since_checkpoint >= args.checkpoint_every
+        ):
+            records = sort_records(records)
+            write_csv(per_graph_csv, records)
+            print(f"[checkpoint] wrote {len(records)} records to {per_graph_csv}")
+            new_records_since_checkpoint = 0
+
+    records = sort_records(records)
+    if records:
+        write_csv(per_graph_csv, records)
 
     stats = summarize_success(records)
     success_records = [row for row in records if row["status"] == "ok"]
@@ -250,11 +341,6 @@ def benchmark(args: argparse.Namespace) -> dict[str, Any]:
         **stats,
     }
 
-    per_graph_csv = output_dir / f"{run_name}_per_graph.csv"
-    summary_json = output_dir / f"{run_name}_summary.json"
-    summary_csv = output_dir / f"{run_name}_summary.csv"
-
-    write_csv(per_graph_csv, records)
     summary_json.parent.mkdir(parents=True, exist_ok=True)
     with summary_json.open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2)
@@ -295,6 +381,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--flow_tol", type=float, default=1e-9)
     parser.add_argument("--retry_flow_iter", type=int, default=2000)
     parser.add_argument("--print_every", type=int, default=10)
+    parser.add_argument(
+        "--checkpoint_every",
+        type=int,
+        default=10,
+        help="Write the per-graph CSV every N newly solved graphs; <=0 disables checkpointing.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Reuse an existing per-graph CSV and skip already benchmarked pair_index rows.",
+    )
     return parser.parse_args()
 
 

@@ -1,6 +1,6 @@
 """
-Frank-Wolfe (Markov-Logit SUE) Runtime Benchmark
-=================================================
+Markov-Logit SUE Runtime Benchmark
+==================================
 
 Standalone script to measure the average wall-clock time of the traditional
 SUE solver on the test split of the (G, G') network pairs dataset.
@@ -88,6 +88,8 @@ def benchmark_sue_on_test_split(args):
             od_matrix=od_matrix,
             capacities=caps,
             free_flow_times=ffts,
+            node_ids=pair.get('node_ids', tuple(sorted(G_prime.nodes()))),
+            centroid_nodes=pair.get('centroid_nodes'),
             max_iter=args.max_iter,
             convergence_threshold=args.conv_thr,
             verbose=False,
@@ -103,7 +105,7 @@ def benchmark_sue_on_test_split(args):
     # ── Statistics ──────────────────────────────────────────────────────
     times = np.array(times_sec)
     print(f"\n{'='*60}")
-    print(f"  Frank-Wolfe (Markov-Logit SUE) Runtime Benchmark")
+    print(f"  Markov-Logit SUE Runtime Benchmark")
     print(f"{'='*60}")
     print(f"  Graphs tested     : {len(times)}")
     print(f"  Total time        : {times.sum():.2f} s")
@@ -123,7 +125,7 @@ def benchmark_sue_on_test_split(args):
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description='Benchmark Frank-Wolfe SUE solver runtime on test set',
+        description='Benchmark Markov-logit SUE solver runtime on test set',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument('--input_pkl', type=str,
@@ -146,7 +148,7 @@ def parse_args():
 
 if __name__ == '__main__':
     print(f"\n{'='*60}")
-    print(f"  Frank-Wolfe Runtime Benchmark")
+    print(f"  Markov-Logit SUE Runtime Benchmark")
     print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*60}\n")
     args = parse_args()

@@ -10,17 +10,20 @@ _MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 @dataclass(frozen=True)
 class MutationPolicy:
-    """Targeted joint-mutation policy used by the data generator."""
+    """Realistic single-reconfiguration policy used by the data generator."""
 
-    high_flow_add_ratio: float = 0.30
-    edges_per_node_range: Tuple[int, int] = (1, 3)
-    low_flow_delete_ratio: float = 0.20
-    delete_edges_per_node: int = 1
-    attribute_change_edge_ratio: float = 0.20
-    cap_scale_range: Tuple[float, float] = (0.3, 2.0)
-    spd_scale_range: Tuple[float, float] = (0.3, 2.0)
-    capacity_bounds: Tuple[float, float] = (4000.0, 26000.0)
-    speed_bounds: Tuple[float, float] = (45.0, 80.0)
+    closure_probability: float = 0.40
+    capacity_change_probability: float = 0.40
+    new_link_probability: float = 0.20
+    closure_ratios: Tuple[float, float] = (0.05, 0.10)
+    capacity_change_edge_ratio: float = 0.10
+    capacity_reduction_probability: float = 0.70
+    capacity_reduction_scale_range: Tuple[float, float] = (0.50, 0.90)
+    capacity_expansion_scale_range: Tuple[float, float] = (1.10, 1.50)
+    new_link_edge_ratio: float = 0.01
+    max_new_links: int = 3
+    new_link_hop_range: Tuple[int, int] = (2, 3)
+    new_link_length_scale_range: Tuple[float, float] = (0.60, 0.90)
 
 
 @dataclass(frozen=True)
@@ -30,10 +33,9 @@ class NetworkSpec:
     network_name: str
     dataset_root: str
     network_file: str
-    od_file: str = ""
+    od_file: str
     parser: str = "tntp"
     node_id_offset: int = 1
-    demand_source: str = "lhs"
     centroid_nodes: Optional[Tuple[int, ...]] = None
     mutation_policy: MutationPolicy = MutationPolicy()
 
@@ -43,22 +45,22 @@ _BUILTIN_SPECS = {
         "network_name": "SiouxFalls",
         "dataset_root": "../sioux_data",
         "network_file": "SiouxFalls_net.tntp",
-        "od_file": "",
-        "centroid_nodes": tuple(range(1, 12)),
+        "od_file": "SiouxFalls_trips.tntp",
+        "centroid_nodes": tuple(range(1, 25)),
     },
     "ema": {
         "network_name": "EMA",
         "dataset_root": "../ema_data",
         "network_file": "EMA_net.tntp",
         "od_file": "EMA_trips.tntp",
-        "centroid_nodes": None,
+        "centroid_nodes": tuple(range(1, 75)),
     },
     "anaheim": {
         "network_name": "Anaheim",
         "dataset_root": "../anaheim_data",
         "network_file": "Anaheim_net.tntp",
         "od_file": "Anaheim_trips.tntp",
-        "centroid_nodes": None,
+        "centroid_nodes": tuple(range(1, 39)),
     },
 }
 
@@ -104,14 +106,18 @@ def _build_custom_spec(
     od_file: str,
     parser: str,
     node_id_offset: int,
-    demand_source: str,
     centroid_nodes: Optional[Tuple[int, ...]],
 ) -> NetworkSpec:
     if not network_file:
         raise ValueError(
             f"Unknown network_name='{network_name}'. "
-            "Provide --network_file (and optionally --dataset_root / --od_file) "
+            "Provide --network_file and --od_file (and optionally --dataset_root) "
             "to use a custom network preset."
+        )
+    if not od_file:
+        raise ValueError(
+            f"Unknown network_name='{network_name}'. "
+            "Provide --od_file for the baseline TNTP OD matrix."
         )
 
     resolved_root = _resolve_dataset_root(dataset_root, relative_to_module=False)
@@ -128,7 +134,6 @@ def _build_custom_spec(
         od_file=resolved_od_file,
         parser=parser,
         node_id_offset=node_id_offset,
-        demand_source=demand_source,
         centroid_nodes=centroid_nodes,
         mutation_policy=MutationPolicy(),
     )
@@ -141,7 +146,6 @@ def resolve_network_spec(
     od_file: str = "",
     parser: str = "tntp",
     node_id_offset: int = 1,
-    demand_source: str = "lhs",
     centroid_nodes: Optional[Iterable[int] | str] = None,
 ) -> NetworkSpec:
     key = _normalize_name(network_name)
@@ -155,7 +159,6 @@ def resolve_network_spec(
             od_file=od_file,
             parser=parser,
             node_id_offset=node_id_offset,
-            demand_source=demand_source,
             centroid_nodes=explicit_centroids,
         )
 
@@ -177,7 +180,6 @@ def resolve_network_spec(
         od_file=resolved_od_file,
         parser=parser,
         node_id_offset=node_id_offset,
-        demand_source=demand_source,
         centroid_nodes=explicit_centroids,
         mutation_policy=MutationPolicy(),
     )

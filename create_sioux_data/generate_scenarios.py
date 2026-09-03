@@ -1,27 +1,21 @@
-"""
-Generate network reconfiguration scenarios: (G, G') network pair data
+"""Generate realism-preserving traffic scenarios and network pairs.
 
-This module accomplishes the following tasks:
-1. Uses Latin Hypercube Sampling (LHS) to generate base scenario OD matrices and G edge attributes
-2. Implements the targeted joint-mutation strategy used to build each G'
-3. Constructs (G, G') network pairs where every sample undergoes topology change + attribute change
+Each sample starts from the attributes and OD matrix of a parsed TNTP
+baseline.  Demand, capacity, and speed receive small multiplicative operating
+condition perturbations.  The resulting graph ``G`` is then changed by exactly
+one flow-independent reconfiguration to produce ``G_prime``.
 
-Strict Constraints:
-- G and G' share exactly the same OD matrix (OD is only used for SUE computation, never as node features)
-- G and G' have identical node sets; only edges and edge attributes may vary
-- Every generated sample applies:
-  * add edges from the highest-flow 30% nodes
-  * delete one outgoing edge from the lowest-flow 20% nodes
-  * mutate attributes on a random 20% subset of edges
+The node set and OD matrix are identical in ``G`` and ``G_prime``.  OD is
+stored for SUE solving only and is not converted into a model feature here.
 """
 
 from copy import deepcopy
-import math
-from typing import Optional
+import os
+import pickle
+from typing import Optional, Sequence
 
 import networkx as nx
 import numpy as np
-from scipy.stats import qmc
 from tqdm import tqdm
 
 try:
@@ -30,669 +24,678 @@ except ModuleNotFoundError:
     from .network_registry import MutationPolicy
 
 
-# ============================================================
-# Part 1: Base Scenario Generation (LHS Sampling)
-# ============================================================
-
-def generate_lhs_base_scenarios(
-    num_samples: int = 2000,
-    num_centroids: int = 11,
-    num_edges: int = 76,
-    seed: int = 42
-) -> tuple:
-    """
-    Use Latin Hypercube Sampling (LHS) to generate base scenario OD matrices and edge attributes for G.
-
-    Parameter ranges (from paper specifications, after network_parser.py
-    normalizes explicit TNTP units such as Anaheim ft / ft-min to miles / mph):
-    - OD demand: 0 - 1500 vehicles/OD pair
-    - Capacity: 4000 - 26000
-    - Speed: 45 - 80 distance/hour units
-
-    Args:
-        num_samples:   Number of scenarios to generate (default 2000)
-        num_centroids: Number of centroid nodes (11 for Sioux Falls)
-        num_edges:     Number of edges (76 for Sioux Falls)
-        seed:          Random seed
-
-    Returns:
-        od_matrices: np.ndarray [num_samples, num_centroids, num_centroids]
-        capacities:  np.ndarray [num_samples, num_edges]   -- G's capacities
-        speeds:      np.ndarray [num_samples, num_edges]   -- G's speeds
-    """
-    print(f"\n{'='*60}")
-    print(f"Generating {num_samples} base scenarios with LHS sampling")
-    print(f"{'='*60}")
-
-    num_od_pairs = num_centroids * num_centroids          # 11*11 = 121
-    num_dims = num_od_pairs + num_edges * 2               # 121 + 76 + 76 = 273
-
-    sampler = qmc.LatinHypercube(d=num_dims, seed=seed)
-    samples = sampler.random(n=num_samples)               # [num_samples, 273]
-
-    # Split by dimension
-    od_raw  = samples[:, :num_od_pairs]                   # [N, 121]
-    cap_raw = samples[:, num_od_pairs : num_od_pairs + num_edges]   # [N, 76]
-    spd_raw = samples[:, num_od_pairs + num_edges:]       # [N, 76]
-
-    # Map to actual range
-    od_matrices = (od_raw * 1500.0).reshape(num_samples, num_centroids, num_centroids)
-    capacities  = cap_raw * (26000 - 4000) + 4000
-    speeds      = spd_raw * (80 - 45) + 45
-
-    print(f"  OD matrix shape:  {od_matrices.shape}")
-    print(f"  Capacity matrix shape: {capacities.shape}")
-    print(f"  Speed matrix shape: {speeds.shape}")
-    print(f"  OD range: [{od_matrices.min():.1f}, {od_matrices.max():.1f}]")
-    print(f"  Capacity range: [{capacities.min():.1f}, {capacities.max():.1f}]")
-    print(f"  Speed range: [{speeds.min():.1f}, {speeds.max():.1f}]")
-    print(f"  LHS sampling complete!")
-
-    return od_matrices, capacities, speeds
+class ReconfigurationError(RuntimeError):
+    """Raised when a requested reconfiguration cannot be applied safely."""
 
 
-def _generate_lhs_edge_parameters(
-    num_samples: int,
-    num_edges: int,
-    seed: int = 42,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Generate edge capacities and speeds without regenerating OD matrices."""
-    sampler = qmc.LatinHypercube(d=num_edges * 2, seed=seed)
-    samples = sampler.random(n=num_samples)
+def _validate_positive_edge_attributes(graph: nx.DiGraph) -> None:
+    """Reject baselines that cannot support physical perturbations."""
+    if graph.number_of_nodes() == 0:
+        raise ValueError("baseline_graph must contain at least one node.")
+    if graph.number_of_edges() == 0:
+        raise ValueError("baseline_graph must contain at least one edge.")
 
-    cap_raw = samples[:, :num_edges]
-    spd_raw = samples[:, num_edges:]
+    for u, v, data in graph.edges(data=True):
+        for name in ("capacity", "speed", "length"):
+            if name not in data:
+                raise ValueError(f"Edge {(u, v)} is missing required attribute '{name}'.")
+            value = float(data[name])
+            if not np.isfinite(value) or value <= 0.0:
+                raise ValueError(
+                    f"Edge {(u, v)} has invalid {name}={data[name]!r}; "
+                    f"all physical edge attributes must be finite and positive."
+                )
 
-    capacities = cap_raw * (26000 - 4000) + 4000
-    speeds = spd_raw * (80 - 45) + 45
-    return capacities, speeds
 
-
-def generate_base_scenarios_from_od_matrix(
+def generate_baseline_perturbed_scenarios(
     base_od_matrix: np.ndarray,
+    baseline_graph: nx.DiGraph,
     num_samples: int = 2000,
-    num_edges: int = 76,
     seed: int = 42,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Repeat a parsed OD matrix while still sampling edge attributes with LHS."""
-    if base_od_matrix.ndim != 2 or base_od_matrix.shape[0] != base_od_matrix.shape[1]:
-        raise ValueError("base_od_matrix must be a square [C, C] matrix.")
+    """Generate scenarios by perturbing a TNTP OD/network baseline.
 
-    od_matrices = np.repeat(base_od_matrix[None, :, :], num_samples, axis=0)
-    capacities, speeds = _generate_lhs_edge_parameters(
-        num_samples=num_samples,
-        num_edges=num_edges,
-        seed=seed,
+    For scenario ``s`` the OD multiplier is
+    ``clip(g_s * origin_factor_i * destination_factor_j, 0.5, 1.5)``,
+    with ``g_s`` in ``[0.90, 1.10]`` and the origin/destination factors in
+    ``[0.85, 1.15]``.  Baseline-zero OD entries remain zero and the diagonal is
+    forced to zero.  Edge capacities and speeds are independently scaled by
+    ``[0.90, 1.10]`` and ``[0.95, 1.05]`` respectively.  Length is never
+    sampled; it remains stored on ``baseline_graph`` and is reused later by
+    :func:`build_scenario_graph`.
+
+    The three returned arrays intentionally retain the existing downstream
+    shapes: ``[N, C, C]``, ``[N, E]``, and ``[N, E]``.
+    """
+    num_samples = int(num_samples)
+    if num_samples <= 0:
+        raise ValueError("num_samples must be a positive integer.")
+    if not isinstance(baseline_graph, nx.DiGraph):
+        raise TypeError("baseline_graph must be a networkx.DiGraph.")
+
+    base_od = np.asarray(base_od_matrix, dtype=np.float64)
+    if base_od.ndim != 2 or base_od.shape[0] != base_od.shape[1]:
+        raise ValueError("base_od_matrix must be a square [C, C] matrix.")
+    if base_od.shape[0] == 0:
+        raise ValueError("base_od_matrix must contain at least one centroid.")
+    if not np.all(np.isfinite(base_od)) or np.any(base_od < 0.0):
+        raise ValueError("base_od_matrix must contain finite, non-negative demand.")
+
+    _validate_positive_edge_attributes(baseline_graph)
+    edges = list(baseline_graph.edges())
+    baseline_capacities = np.asarray(
+        [baseline_graph[u][v]["capacity"] for u, v in edges],
+        dtype=np.float64,
     )
+    baseline_speeds = np.asarray(
+        [baseline_graph[u][v]["speed"] for u, v in edges],
+        dtype=np.float64,
+    )
+
+    num_centroids = int(base_od.shape[0])
+    num_edges = len(edges)
+    od_matrices = np.empty(
+        (num_samples, num_centroids, num_centroids),
+        dtype=np.float64,
+    )
+    capacities = np.empty((num_samples, num_edges), dtype=np.float64)
+    speeds = np.empty((num_samples, num_edges), dtype=np.float64)
+
+    rng = np.random.default_rng(seed)
+    zero_mask = base_od == 0.0
+    for sample_idx in range(num_samples):
+        global_factor = float(rng.uniform(0.90, 1.10))
+        origin_factors = rng.uniform(0.85, 1.15, size=num_centroids)
+        destination_factors = rng.uniform(0.85, 1.15, size=num_centroids)
+        od_multiplier = np.clip(
+            global_factor * origin_factors[:, None] * destination_factors[None, :],
+            0.50,
+            1.50,
+        )
+
+        scenario_od = base_od * od_multiplier
+        scenario_od[zero_mask] = 0.0
+        np.fill_diagonal(scenario_od, 0.0)
+        od_matrices[sample_idx] = scenario_od
+
+        capacities[sample_idx] = baseline_capacities * rng.uniform(
+            0.90,
+            1.10,
+            size=num_edges,
+        )
+        speeds[sample_idx] = baseline_speeds * rng.uniform(
+            0.95,
+            1.05,
+            size=num_edges,
+        )
+
     return od_matrices, capacities, speeds
 
 
-def _scaled_count(size: int, ratio: float, minimum: int = 1) -> int:
-    """Convert a ratio to a valid integer count using ceil."""
+def _ratio_count(size: int, ratio: float) -> int:
+    """Translate a requested ratio into a non-zero, bounded edge count."""
     if size <= 0:
         return 0
-    return min(size, max(minimum, int(math.ceil(size * ratio))))
+    return min(size, max(1, int(round(float(ratio) * size))))
 
 
-def _compute_node_flow_sum(
-    G: nx.DiGraph,
-    flows_old: np.ndarray,
-) -> dict[int, float]:
-    """Aggregate incident old-graph flow onto each node."""
-    edges = list(G.edges())
-    if len(edges) != int(len(flows_old)):
-        raise ValueError(
-            f"flows_old length ({len(flows_old)}) does not match graph edge count ({len(edges)})."
+def _mutation_choices(policy: MutationPolicy) -> tuple[tuple[str, ...], np.ndarray]:
+    mutation_types = ("closure", "capacity_change", "new_link")
+    probabilities = np.asarray(
+        [
+            policy.closure_probability,
+            policy.capacity_change_probability,
+            policy.new_link_probability,
+        ],
+        dtype=np.float64,
+    )
+    if not np.all(np.isfinite(probabilities)) or np.any(probabilities < 0.0):
+        raise ValueError("Mutation probabilities must be finite and non-negative.")
+    if not np.isclose(float(probabilities.sum()), 1.0, rtol=0.0, atol=1e-12):
+        raise ValueError("Mutation probabilities must sum to 1.0.")
+    return mutation_types, probabilities
+
+
+def _reachable_positive_od_pairs(
+    graph: nx.DiGraph,
+    od_matrix: np.ndarray,
+    centroid_nodes: Sequence[int],
+) -> tuple[tuple[int, int], ...]:
+    """Return positive-demand centroid pairs that are reachable in ``graph``."""
+    od = np.asarray(od_matrix, dtype=np.float64)
+    centroids = tuple(int(node_id) for node_id in centroid_nodes)
+    if od.shape != (len(centroids), len(centroids)):
+        raise ReconfigurationError(
+            "OD shape and centroid_nodes disagree while checking closure connectivity."
         )
 
-    node_flow_sum = {int(node_id): 0.0 for node_id in G.nodes()}
-    for idx, (u, v) in enumerate(edges):
-        flow_value = float(flows_old[idx])
-        node_flow_sum[int(u)] += flow_value
-        node_flow_sum[int(v)] += flow_value
-    return node_flow_sum
+    reachable_pairs = []
+    for origin_idx, destination_idx in np.argwhere(od > 0.0):
+        if origin_idx == destination_idx:
+            continue
+        origin = centroids[int(origin_idx)]
+        destination = centroids[int(destination_idx)]
+        if nx.has_path(graph, origin, destination):
+            reachable_pairs.append((origin, destination))
+    return tuple(reachable_pairs)
 
 
-def _select_ranked_nodes(
-    node_flow_sum: dict[int, float],
-    count: int,
-    descending: bool,
-) -> list[int]:
-    """Select the highest- or lowest-flow nodes according to count."""
-    if count <= 0:
-        return []
-    sorted_nodes = sorted(
-        node_flow_sum,
-        key=lambda node_id: node_flow_sum[node_id],
-        reverse=descending,
+def mutate_closure(
+    graph: nx.DiGraph,
+    rng: np.random.Generator,
+    closure_ratios: Sequence[float],
+    od_matrix: np.ndarray,
+    centroid_nodes: Sequence[int],
+) -> tuple[nx.DiGraph, dict]:
+    """Randomly close links while preserving the baseline reachability contract."""
+    ratios = tuple(float(value) for value in closure_ratios)
+    if not ratios or any(not np.isfinite(value) or value <= 0.0 or value > 1.0 for value in ratios):
+        raise ValueError("closure_ratios must contain values in (0, 1].")
+
+    candidates = [(u, v) for u, v in graph.edges() if u != v]
+    if not candidates:
+        raise ReconfigurationError("Closure failed: the graph has no non-self-loop edge.")
+
+    requested_ratio = float(rng.choice(np.asarray(ratios, dtype=np.float64)))
+    requested_count = _ratio_count(graph.number_of_edges(), requested_ratio)
+    preserve_strong_connectivity = nx.is_strongly_connected(graph)
+    reachable_od_pairs = (
+        tuple()
+        if preserve_strong_connectivity
+        else _reachable_positive_od_pairs(graph, od_matrix, centroid_nodes)
     )
-    return [int(node_id) for node_id in sorted_nodes[:count]]
 
+    mutated = deepcopy(graph)
+    deleted_edges = []
+    for candidate_idx in rng.permutation(len(candidates)):
+        if len(deleted_edges) >= requested_count:
+            break
+        u, v = candidates[int(candidate_idx)]
+        if not mutated.has_edge(u, v):
+            continue
 
-def _resolve_mutation_ranges(
-    G: nx.DiGraph,
-    mutation_policy: Optional[MutationPolicy],
-) -> dict:
-    """Resolve absolute mutation counts from graph size and policy ratios."""
-    policy = mutation_policy or MutationPolicy()
-    num_nodes = max(G.number_of_nodes(), 1)
-    num_edges = max(G.number_of_edges(), 1)
+        trial = mutated.copy()
+        trial.remove_edge(u, v)
+        if preserve_strong_connectivity:
+            remains_valid = nx.is_strongly_connected(trial)
+        else:
+            remains_valid = all(
+                nx.has_path(trial, origin, destination)
+                for origin, destination in reachable_od_pairs
+            )
 
-    return {
-        'num_add_nodes': _scaled_count(num_nodes, policy.high_flow_add_ratio, minimum=1),
-        'edges_per_node_range': policy.edges_per_node_range,
-        'num_delete_nodes': _scaled_count(num_nodes, policy.low_flow_delete_ratio, minimum=1),
-        'delete_edges_per_node': max(1, int(policy.delete_edges_per_node)),
-        'num_attr_change_edges': _scaled_count(
-            num_edges,
-            policy.attribute_change_edge_ratio,
-            minimum=1,
-        ),
-        'cap_scale_range': policy.cap_scale_range,
-        'spd_scale_range': policy.spd_scale_range,
-        'capacity_bounds': policy.capacity_bounds,
-        'speed_bounds': policy.speed_bounds,
+        if remains_valid:
+            mutated.remove_edge(u, v)
+            deleted_edges.append((int(u), int(v)))
+
+    if not deleted_edges:
+        raise ReconfigurationError(
+            "Closure failed: no edge could be removed without breaking required connectivity."
+        )
+
+    return mutated, {
+        "deleted_edges": deleted_edges,
+        "requested_ratio": requested_ratio,
+        "requested_count": requested_count,
+        "actual_deleted_count": len(deleted_edges),
     }
 
 
-# ============================================================
-# Part 2: Three Types of Topology Mutation Algorithms
-# ============================================================
-
-def mutate_add_edges(
-    G: nx.DiGraph,
-    candidate_nodes: list[int],
+def mutate_capacity_change(
+    graph: nx.DiGraph,
     rng: np.random.Generator,
-    edges_per_node_range: tuple = (1, 3),
-) -> tuple:
-    """
-    Mutation Operation 1: Add Edges
-    Add new out-edges to the highest-flow nodes of G.
+    edge_ratio: float,
+    reduction_probability: float,
+    reduction_scale_range: Sequence[float],
+    expansion_scale_range: Sequence[float],
+) -> tuple[nx.DiGraph, dict]:
+    """Change capacity on a random edge subset without changing other attributes."""
+    edge_ratio = float(edge_ratio)
+    reduction_probability = float(reduction_probability)
+    reduction_range = tuple(float(value) for value in reduction_scale_range)
+    expansion_range = tuple(float(value) for value in expansion_scale_range)
+    if not np.isfinite(edge_ratio) or edge_ratio <= 0.0 or edge_ratio > 1.0:
+        raise ValueError("capacity_change_edge_ratio must be in (0, 1].")
+    if not np.isfinite(reduction_probability) or not 0.0 <= reduction_probability <= 1.0:
+        raise ValueError("capacity_reduction_probability must be in [0, 1].")
+    if (
+        len(reduction_range) != 2
+        or len(expansion_range) != 2
+        or not 0.0 < reduction_range[0] <= reduction_range[1]
+        or not 0.0 < expansion_range[0] <= expansion_range[1]
+    ):
+        raise ValueError("Capacity scale ranges must be ordered and strictly positive.")
 
-    Algorithm logic:
-    1. Candidate nodes are pre-selected outside this function from the top 30% highest-flow nodes.
-    2. For each candidate node, randomly add 1-3 out-edges:
-       - Target node: uniform random sample from all nodes in G, excluding self and already connected targets
-       - New edge attributes: uniformly sample within [min, max] of each attribute from existing edges; ensures reasonable values
-       - Automatically calculate free_flow_time = (length / speed) * 60
-         after parser-level unit normalization
+    edges = list(graph.edges())
+    requested_count = _ratio_count(len(edges), edge_ratio)
+    if requested_count == 0:
+        raise ReconfigurationError("Capacity change failed: the graph has no edge.")
 
-    Args:
-        G:                  Current scenario NetworkX DiGraph (with full edge attributes)
-        candidate_nodes:    Highest-flow source nodes selected from the old graph
-        rng:                numpy random generator
-        edges_per_node_range: Range for number of edges to add per node (inclusive)
-
-    Returns:
-        G_new:       DiGraph with new edges added
-        added_edges: list of (u, v) newly added directed edges
-    """
-    edges    = list(G.edges())
-    node_ids = list(G.nodes())   # Sioux Falls: nodes 1-24
-
-    # --- Step 1: For each high-flow node, add 1-3 new out-edges ---
-    G_new = deepcopy(G)
-    added_edges = []
-
-    # Compute attribute ranges from existing edges; new edges uniformly sample in-range
-    all_caps = [G[u][v]['capacity']      for u, v in edges]
-    all_spds = [G[u][v]['speed']         for u, v in edges]
-    all_lens = [G[u][v]['length']        for u, v in edges]
-    cap_min, cap_max = min(all_caps), max(all_caps)
-    spd_min, spd_max = min(all_spds), max(all_spds)
-    len_min, len_max = min(all_lens), max(all_lens)
-
-    for node in candidate_nodes:
-        # Exclude self and already existing out-edge targets (no repeats)
-        existing_targets = set(G_new.successors(node))
-        candidates = [n for n in node_ids if n != node and n not in existing_targets]
-
-        if not candidates:
-            # Node already connected to all other nodes; skip
-            continue
-
-        num_to_add = int(rng.integers(edges_per_node_range[0], edges_per_node_range[1] + 1))
-        num_to_add = min(num_to_add, len(candidates))
-
-        # Randomly pick target nodes from candidates
-        targets = rng.choice(candidates, size=num_to_add, replace=False)
-
-        for target in targets:
-            # Edge attributes: sample uniformly within [min, max] from existing
-            new_cap = float(rng.uniform(cap_min, cap_max))
-            new_spd = float(rng.uniform(spd_min, spd_max))
-            new_len = float(rng.uniform(len_min, len_max))
-            # free_flow_time (minutes) = length / speed * 60
-            # after parser-level unit normalization.
-            new_fft = (new_len / new_spd) * 60.0
-
-            G_new.add_edge(
-                int(node), int(target),
-                capacity=new_cap,
-                speed=new_spd,
-                length=new_len,
-                free_flow_time=new_fft
-            )
-            added_edges.append((int(node), int(target)))
-
-    return G_new, added_edges
-
-
-def mutate_delete_edges(
-    G: nx.DiGraph,
-    candidate_nodes: list[int],
-    rng: np.random.Generator,
-    delete_edges_per_node: int = 1,
-) -> tuple:
-    """
-    Mutation Operation 2: Delete Edges
-    Delete outgoing edges from the lowest-flow nodes while maintaining strong connectivity.
-
-    Algorithm logic:
-    1. Randomly determine target number of deletions num_delete ∈ [5, 10]
-    2. Randomly permute the edge order, and try deleting each edge in turn:
-       - Temporarily remove the edge
-       - Check if the graph is still strongly connected
-         * Strong connectivity: for every ordered pair of nodes, there is a directed path from one to the other
-         * This is necessary for SUE to be well-posed
-       - If remains connected: confirm deletion and add to deleted list
-       - If not connected: restore the edge (with all its original attributes)
-    3. Stop as soon as num_delete deletions confirmed
-
-    Note: If after going through all edges, the target is not reached, just keep what you deleted so far (no hard error)
-
-    Args:
-        G:                Current scenario NetworkX DiGraph
-        rng:              numpy random generator
-        num_delete_range: Range for number of edges to delete (inclusive)
-
-    Returns:
-        G_new:         DiGraph after deletions
-        deleted_edges: list of (u, v) deleted directed edges
-    """
-    G_new = deepcopy(G)
-    deleted_edges = []
-
-    for node in candidate_nodes:
-        deletions_for_node = 0
-        outgoing_edges = list(G_new.out_edges(node))
-        if not outgoing_edges:
-            continue
-
-        shuffled_indices = rng.permutation(len(outgoing_edges))
-        for idx in shuffled_indices:
-            if deletions_for_node >= delete_edges_per_node:
-                break
-
-            u, v = outgoing_edges[int(idx)]
-            if not G_new.has_edge(u, v):
-                continue
-
-            edge_data = dict(G_new[u][v])
-            G_new.remove_edge(u, v)
-            if nx.is_strongly_connected(G_new):
-                deleted_edges.append((u, v))
-                deletions_for_node += 1
-            else:
-                G_new.add_edge(u, v, **edge_data)
-
-    return G_new, deleted_edges
-
-
-def mutate_attributes(
-    G: nx.DiGraph,
-    rng: np.random.Generator,
-    num_attr_change_edges: int,
-    cap_scale_range: tuple = (0.3, 2.0),
-    spd_scale_range: tuple = (0.3, 2.0),
-    capacity_bounds: tuple = (4000.0, 26000.0),
-    speed_bounds: tuple = (45.0, 80.0),
-) -> tuple:
-    """
-    Mutation Operation 3: Change Attributes
-    Randomly mutate only a subset of edges, then clip capacity/speed back into feasible bounds.
-
-    Algorithm logic:
-    1. Iterate over every directed edge (u, v) in G
-    2. Independently sample capacity scale λ_cap ~ Uniform(0.3, 2.0)
-       Independently sample speed scale λ_spd ~ Uniform(0.3, 2.0)
-    3. Update attributes:
-       new_capacity      = old_capacity * λ_cap
-       new_speed         = old_speed    * λ_spd
-       new_free_flow_time = (length / new_speed) * 60   (recalculated with updated speed)
-    4. Return the modified graph and per-edge scaling logs
-
-    Note: length is unchanged (physical distance is not affected by reconfiguration);
-    free_flow_time must be recalculated based on updated speed.
-
-    Args:
-        G:               Current scenario NetworkX DiGraph
-        rng:             numpy random generator
-        cap_scale_range: Range for capacity scale factor (inclusive)
-        spd_scale_range: Range for speed scale factor (inclusive)
-
-    Returns:
-        G_new:       DiGraph with attributes mutated
-        attr_changes: dict {(u, v): {'cap_scale': float, 'spd_scale': float}}
-    """
-    G_new = deepcopy(G)
-    attr_changes = {}
-    edges = list(G_new.edges())
-    if not edges:
-        return G_new, attr_changes
-
-    num_attr_change_edges = min(max(1, int(num_attr_change_edges)), len(edges))
-    selected_indices = rng.choice(len(edges), size=num_attr_change_edges, replace=False)
+    selected_indices = rng.choice(len(edges), size=requested_count, replace=False)
+    mutated = deepcopy(graph)
+    changed_edges = []
+    capacity_scale = {}
+    capacity_before = {}
+    capacity_after = {}
 
     for edge_idx in selected_indices:
         u, v = edges[int(edge_idx)]
-        cap_scale = float(rng.uniform(cap_scale_range[0], cap_scale_range[1]))
-        spd_scale = float(rng.uniform(spd_scale_range[0], spd_scale_range[1]))
+        old_capacity = float(mutated[u][v]["capacity"])
+        if rng.random() < reduction_probability:
+            scale = float(rng.uniform(reduction_range[0], reduction_range[1]))
+        else:
+            scale = float(rng.uniform(expansion_range[0], expansion_range[1]))
+        new_capacity = old_capacity * scale
+        if not np.isfinite(new_capacity) or new_capacity <= 0.0:
+            raise ReconfigurationError(
+                f"Capacity change produced invalid capacity on edge {(u, v)}."
+            )
 
-        old_cap = G_new[u][v]['capacity']
-        old_spd = G_new[u][v]['speed']
-        old_len = G_new[u][v]['length']   # Physical distance remains unchanged
+        mutated[u][v]["capacity"] = new_capacity
+        edge = (int(u), int(v))
+        changed_edges.append(edge)
+        capacity_scale[edge] = scale
+        capacity_before[edge] = old_capacity
+        capacity_after[edge] = new_capacity
 
-        new_cap = float(np.clip(old_cap * cap_scale, capacity_bounds[0], capacity_bounds[1]))
-        new_spd = float(np.clip(old_spd * spd_scale, speed_bounds[0], speed_bounds[1]))
-        # free_flow_time (minutes) = length / speed * 60 after unit normalization.
-        new_fft = (old_len / new_spd) * 60.0
+    return mutated, {
+        "changed_edges": changed_edges,
+        "requested_ratio": edge_ratio,
+        "actual_changed_count": len(changed_edges),
+        "capacity_scale": capacity_scale,
+        "capacity_before": capacity_before,
+        "capacity_after": capacity_after,
+    }
 
-        G_new[u][v]['capacity']       = new_cap
-        G_new[u][v]['speed']          = new_spd
-        G_new[u][v]['free_flow_time'] = new_fft
 
-        attr_changes[(u, v)] = {
-            'cap_scale': cap_scale,
-            'spd_scale': spd_scale,
-            'capacity_after_clip': new_cap,
-            'speed_after_clip': new_spd,
+def _topology_local_candidates(
+    graph: nx.DiGraph,
+    hop_range: Sequence[int],
+) -> list[tuple[int, int, tuple[int, ...]]]:
+    """Enumerate missing directed links whose current hop distance is local."""
+    hops = tuple(int(value) for value in hop_range)
+    if len(hops) != 2 or hops[0] < 1 or hops[0] > hops[1]:
+        raise ValueError("new_link_hop_range must be an ordered pair of positive integers.")
+    min_hops, max_hops = hops
+
+    candidates = []
+    for source in graph.nodes():
+        paths = nx.single_source_shortest_path(graph, source, cutoff=max_hops)
+        for target, path in paths.items():
+            hop_distance = len(path) - 1
+            if (
+                source != target
+                and min_hops <= hop_distance <= max_hops
+                and not graph.has_edge(source, target)
+            ):
+                candidates.append(
+                    (int(source), int(target), tuple(int(node_id) for node_id in path))
+                )
+    return candidates
+
+
+def mutate_new_link(
+    graph: nx.DiGraph,
+    rng: np.random.Generator,
+    edge_ratio: float,
+    max_new_links: int,
+    hop_range: Sequence[int],
+    length_scale_range: Sequence[float],
+) -> tuple[nx.DiGraph, dict]:
+    """Add topology-local shortcut links with corridor-derived attributes."""
+    edge_ratio = float(edge_ratio)
+    max_new_links = int(max_new_links)
+    length_range = tuple(float(value) for value in length_scale_range)
+    if not np.isfinite(edge_ratio) or edge_ratio <= 0.0:
+        raise ValueError("new_link_edge_ratio must be positive.")
+    if max_new_links <= 0:
+        raise ValueError("max_new_links must be positive.")
+    if (
+        len(length_range) != 2
+        or not 0.0 < length_range[0] <= length_range[1]
+    ):
+        raise ValueError("new_link_length_scale_range must be ordered and positive.")
+
+    requested_count = min(
+        max_new_links,
+        max(1, int(round(edge_ratio * graph.number_of_edges()))),
+    )
+    candidates = _topology_local_candidates(graph, hop_range)
+    if not candidates:
+        raise ReconfigurationError(
+            "New-link mutation failed: no missing link has an admissible hop distance."
+        )
+
+    actual_target = min(requested_count, len(candidates))
+    selected_indices = rng.choice(len(candidates), size=actual_target, replace=False)
+    mutated = deepcopy(graph)
+    added_edges = []
+    added_edge_attributes = {}
+
+    for candidate_idx in selected_indices:
+        u, v, path = candidates[int(candidate_idx)]
+        corridor_edges = list(zip(path[:-1], path[1:]))
+        corridor_length = float(
+            sum(float(graph[a][b]["length"]) for a, b in corridor_edges)
+        )
+        corridor_capacities = np.asarray(
+            [graph[a][b]["capacity"] for a, b in corridor_edges],
+            dtype=np.float64,
+        )
+        corridor_speeds = np.asarray(
+            [graph[a][b]["speed"] for a, b in corridor_edges],
+            dtype=np.float64,
+        )
+
+        shortcut_scale = float(rng.uniform(length_range[0], length_range[1]))
+        new_length = corridor_length * shortcut_scale
+        new_capacity = float(np.median(corridor_capacities))
+        new_speed = float(np.median(corridor_speeds))
+        new_free_flow_time = new_length / new_speed * 60.0
+        generated = np.asarray(
+            [new_capacity, new_speed, new_length, new_free_flow_time],
+            dtype=np.float64,
+        )
+        if not np.all(np.isfinite(generated)) or np.any(generated <= 0.0):
+            raise ReconfigurationError(
+                f"New-link mutation produced invalid attributes for edge {(u, v)}."
+            )
+
+        mutated.add_edge(
+            u,
+            v,
+            capacity=new_capacity,
+            speed=new_speed,
+            length=new_length,
+            free_flow_time=new_free_flow_time,
+        )
+        edge = (int(u), int(v))
+        added_edges.append(edge)
+        added_edge_attributes[edge] = {
+            "capacity": new_capacity,
+            "speed": new_speed,
+            "length": new_length,
+            "free_flow_time": new_free_flow_time,
+            "corridor_path": path,
+            "shortcut_scale": shortcut_scale,
         }
 
-    return G_new, attr_changes
+    if not added_edges:
+        raise ReconfigurationError("New-link mutation failed to add any edge.")
+
+    return mutated, {
+        "added_edges": added_edges,
+        "requested_count": requested_count,
+        "actual_added_count": len(added_edges),
+        "added_edge_attributes": added_edge_attributes,
+    }
 
 
-# ============================================================
-# Part 3: Build Concrete Scenario G and Generate G'
-# ============================================================
-
-def build_scenario_graph(G_topo: nx.DiGraph, capacities_i: np.ndarray, speeds_i: np.ndarray) -> nx.DiGraph:
-    """
-    Assign Sioux Falls base topology (G_topo) with the edge attributes for the i-th scenario,
-    and return the specific G_i for that scenario (can be passed directly to SUE solver).
-
-    Edge order matches exactly list(G_topo.edges()),
-    thus capacities_i[j] corresponds to list(G_topo.edges())[j].
-
-    Args:
-        G_topo:       Sioux Falls base directed graph (with length attribute)
-        capacities_i: np.ndarray [num_edges_G], edge capacities for scenario i
-        speeds_i:     np.ndarray [num_edges_G], edge speeds for scenario i
-
-    Returns:
-        G_i: NetworkX DiGraph with assigned attributes
-    """
-    G_i = deepcopy(G_topo)
-    edges = list(G_topo.edges())
-
-    for j, (u, v) in enumerate(edges):
-        length = G_topo[u][v]['length']         # Physical distance remains unchanged
-        spd    = float(speeds_i[j])
-        cap    = float(capacities_i[j])
-        fft    = (length / spd) * 60.0          # Minutes
-
-        G_i[u][v]['capacity']       = cap
-        G_i[u][v]['speed']          = spd
-        G_i[u][v]['free_flow_time'] = fft
-
-    return G_i
-
-
-def _apply_topology_mutation(
-    G: nx.DiGraph,
-    flows_old: np.ndarray,
-    rng: np.random.Generator,
-    mutation_info: dict,
-    mutation_policy: Optional[MutationPolicy] = None,
+def build_scenario_graph(
+    baseline_graph: nx.DiGraph,
+    capacities_i: np.ndarray,
+    speeds_i: np.ndarray,
 ) -> nx.DiGraph:
-    """
-    Internal helper: apply the targeted topology mutation to G.
+    """Build one operating-condition graph in canonical baseline edge order."""
+    edges = list(baseline_graph.edges())
+    capacities_i = np.asarray(capacities_i, dtype=np.float64).reshape(-1)
+    speeds_i = np.asarray(speeds_i, dtype=np.float64).reshape(-1)
+    if capacities_i.shape != (len(edges),) or speeds_i.shape != (len(edges),):
+        raise ValueError(
+            "Scenario capacity/speed arrays must match list(baseline_graph.edges())."
+        )
+    if (
+        not np.all(np.isfinite(capacities_i))
+        or not np.all(np.isfinite(speeds_i))
+        or np.any(capacities_i <= 0.0)
+        or np.any(speeds_i <= 0.0)
+    ):
+        raise ValueError("Scenario capacities and speeds must be finite and positive.")
 
-    Args:
-        G:           The current graph
-        flows_old:   Historical flows on G (used for identifying top-flow nodes during edge addition)
-        rng:         numpy random generator
-        mutation_info: dict for recording mutation details (modified in-place)
+    scenario_graph = deepcopy(baseline_graph)
+    for edge_idx, (u, v) in enumerate(edges):
+        length = float(baseline_graph[u][v]["length"])
+        speed = float(speeds_i[edge_idx])
+        capacity = float(capacities_i[edge_idx])
+        free_flow_time = length / speed * 60.0
+        if not np.isfinite(free_flow_time) or free_flow_time <= 0.0:
+            raise ValueError(f"Edge {(u, v)} has invalid scenario free-flow time.")
 
-    Returns:
-        G_mutated: Graph after topology mutation
-    """
-    ranges = _resolve_mutation_ranges(G, mutation_policy)
-    node_flow_sum = _compute_node_flow_sum(G, flows_old)
-    high_flow_nodes = _select_ranked_nodes(
-        node_flow_sum=node_flow_sum,
-        count=ranges['num_add_nodes'],
-        descending=True,
-    )
-    low_flow_nodes = _select_ranked_nodes(
-        node_flow_sum=node_flow_sum,
-        count=ranges['num_delete_nodes'],
-        descending=False,
-    )
+        scenario_graph[u][v]["capacity"] = capacity
+        scenario_graph[u][v]["speed"] = speed
+        scenario_graph[u][v]["free_flow_time"] = free_flow_time
 
-    G_mut, added_edges = mutate_add_edges(
-        G,
-        candidate_nodes=high_flow_nodes,
-        rng=rng,
-        edges_per_node_range=ranges['edges_per_node_range'],
-    )
-    G_mut, deleted_edges = mutate_delete_edges(
-        G_mut,
-        candidate_nodes=low_flow_nodes,
-        rng=rng,
-        delete_edges_per_node=ranges['delete_edges_per_node'],
-    )
-
-    mutation_info['topo_op'] = 'add_then_delete'
-    mutation_info['high_flow_nodes'] = high_flow_nodes
-    mutation_info['low_flow_nodes'] = low_flow_nodes
-    mutation_info['added_edges'] = added_edges
-    mutation_info['deleted_edges'] = deleted_edges
-    return G_mut
+    return scenario_graph
 
 
-# ============================================================
-# Part 4: Main Function for Network Pair Generation
-# ============================================================
+def _apply_reconfiguration(
+    graph: nx.DiGraph,
+    mutation_type: str,
+    rng: np.random.Generator,
+    policy: MutationPolicy,
+    od_matrix: np.ndarray,
+    centroid_nodes: Sequence[int],
+) -> tuple[nx.DiGraph, dict]:
+    """Dispatch exactly one primary reconfiguration type."""
+    if mutation_type == "closure":
+        mutated, mutation_info = mutate_closure(
+            graph,
+            rng,
+            closure_ratios=policy.closure_ratios,
+            od_matrix=od_matrix,
+            centroid_nodes=centroid_nodes,
+        )
+    elif mutation_type == "capacity_change":
+        mutated, mutation_info = mutate_capacity_change(
+            graph,
+            rng,
+            edge_ratio=policy.capacity_change_edge_ratio,
+            reduction_probability=policy.capacity_reduction_probability,
+            reduction_scale_range=policy.capacity_reduction_scale_range,
+            expansion_scale_range=policy.capacity_expansion_scale_range,
+        )
+    elif mutation_type == "new_link":
+        mutated, mutation_info = mutate_new_link(
+            graph,
+            rng,
+            edge_ratio=policy.new_link_edge_ratio,
+            max_new_links=policy.max_new_links,
+            hop_range=policy.new_link_hop_range,
+            length_scale_range=policy.new_link_length_scale_range,
+        )
+    else:
+        raise ValueError(f"Unsupported mutation_type={mutation_type!r}.")
+
+    mutation_info = {"type": mutation_type, **mutation_info}
+    return mutated, mutation_info
+
 
 def generate_network_pairs(
     G_topo: nx.DiGraph,
     od_matrices: np.ndarray,
     capacities: np.ndarray,
     speeds: np.ndarray,
-    flows_old: np.ndarray,
     seed: int = 42,
-    network_name: str = 'Unknown',
+    network_name: str = "Unknown",
     node_ids: Optional[tuple[int, ...]] = None,
     centroid_nodes: Optional[tuple[int, ...]] = None,
     node_id_offset: int = 1,
     mutation_policy: Optional[MutationPolicy] = None,
-) -> list:
+) -> tuple[list, list[dict]]:
+    """Generate ``(G, G_prime)`` pairs and explicit mutation-failure records.
+
+    Reconfiguration selection is independent of old flows.  Each successful
+    pair stores its original ``sample_idx`` so later solver filtering cannot
+    misalign it with the corresponding base scenario or old SUE solution.
     """
-    Main function: for each base scenario, generate the corresponding mutated network G', yielding a full list of (G, G') pairs.
+    if not isinstance(G_topo, nx.DiGraph):
+        raise TypeError("G_topo must be a networkx.DiGraph.")
+    _validate_positive_edge_attributes(G_topo)
 
-    Current strategy:
-    - every sample applies topology change + attribute change
-    - topology change = add edges on high-flow nodes, then delete edges on low-flow nodes
-    - attribute change = randomly perturb 20% of edges and clip back to feasible bounds
+    od_matrices = np.asarray(od_matrices, dtype=np.float64)
+    capacities = np.asarray(capacities, dtype=np.float64)
+    speeds = np.asarray(speeds, dtype=np.float64)
+    if od_matrices.ndim != 3 or od_matrices.shape[1] != od_matrices.shape[2]:
+        raise ValueError("od_matrices must have shape [N, C, C].")
 
-    Returned structure for each pair (scenario_pair dict):
-    ```
-    {
-        'od_matrix'     : np.ndarray [11, 11],  # shared OD matrix (for SUE only, never model input!)
-        'G'             : nx.DiGraph,           # scenario G (fixed topology + LHS attributes)
-        'G_prime'       : nx.DiGraph,           # mutated network G' (may have different edge set and attributes)
-        'mutation_type' : str,                  # always 'both' under the targeted strategy
-        'mutation_info' : dict,                 # details: added/deleted edges, attribute scaling info
-    }
-    ```
+    num_samples = int(od_matrices.shape[0])
+    num_edges = G_topo.number_of_edges()
+    if capacities.shape != (num_samples, num_edges):
+        raise ValueError(
+            f"capacities must have shape {(num_samples, num_edges)}, got {capacities.shape}."
+        )
+    if speeds.shape != (num_samples, num_edges):
+        raise ValueError(
+            f"speeds must have shape {(num_samples, num_edges)}, got {speeds.shape}."
+        )
+    if num_samples == 0:
+        return [], []
 
-    Node set consistency guarantee:
-    - G and G' always have identical node sets (24 nodes in Sioux Falls)
-    - Nodes are never added or deleted; only edge set and edge attributes are changed
+    resolved_node_ids = (
+        tuple(int(node_id) for node_id in node_ids)
+        if node_ids is not None
+        else tuple(int(node_id) for node_id in sorted(G_topo.nodes()))
+    )
+    if len(set(resolved_node_ids)) != len(resolved_node_ids) or set(resolved_node_ids) != set(G_topo.nodes()):
+        raise ValueError("node_ids must list every graph node exactly once.")
+    if centroid_nodes is None:
+        raise ValueError("centroid_nodes is required for OD-to-node alignment.")
+    resolved_centroids = tuple(int(node_id) for node_id in centroid_nodes)
+    od_dim = int(od_matrices.shape[1])
+    if len(resolved_centroids) != od_dim:
+        raise ValueError(
+            f"centroid_nodes has length {len(resolved_centroids)}, but OD dimension is {od_dim}."
+        )
+    if len(set(resolved_centroids)) != len(resolved_centroids):
+        raise ValueError("centroid_nodes must not contain duplicates.")
+    if not set(resolved_centroids).issubset(G_topo.nodes()):
+        raise ValueError("Every centroid node must exist in G_topo.")
 
-    Args:
-        G_topo:      Sioux Falls base directed graph (read from .tntp file, contains length attribute)
-        od_matrices: np.ndarray [N, 11, 11], OD matrices generated by LHS
-        capacities:  np.ndarray [N, 76],     G's capacities generated by LHS
-        speeds:      np.ndarray [N, 76],     G's speeds generated by LHS
-        flows_old:   np.ndarray [N, 76],     historical flows solved on G (used to locate top-flow nodes for edge add mutations)
-        seed:        Random seed
-
-    Returns:
-        scenario_pairs: list of dict, length N
-    """
-    num_samples = od_matrices.shape[0]
+    policy = mutation_policy or MutationPolicy()
+    mutation_names, mutation_probabilities = _mutation_choices(policy)
     rng = np.random.default_rng(seed)
+    mutation_types = rng.choice(
+        np.asarray(mutation_names, dtype=object),
+        size=num_samples,
+        p=mutation_probabilities,
+    )
 
-    mutation_types = np.full(num_samples, 'both', dtype=object)
-
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"Generating {num_samples} (G, G') network pairs")
-    print(f"{'='*60}")
-    print("  Mutation type distribution:")
-    print(f"    Topology+attribute (both): {num_samples} ({100.0:.1f}%)")
+    print(f"{'=' * 60}")
+    print("  Primary mutation probabilities:")
+    for mutation_name, probability in zip(mutation_names, mutation_probabilities):
+        print(f"    {mutation_name:16s}: {probability:.0%}")
 
     scenario_pairs = []
-    num_nodes = G_topo.number_of_nodes()
-    node_ids = tuple(node_ids) if node_ids is not None else tuple(sorted(G_topo.nodes()))
-    centroid_nodes = tuple(centroid_nodes) if centroid_nodes is not None else tuple()
-
-    for i in tqdm(range(num_samples), desc="  Generating network pairs"):
-        mutation_type = mutation_types[i]
-        mutation_info = {'type': mutation_type}
-
-        # --- Step 1: Build G_i for scenario i (fixed topology + LHS attributes) ---
-        G_i = build_scenario_graph(G_topo, capacities[i], speeds[i])
-
-        # --- Step 2: Starting from G_i, build G' ---
-        G_prime = deepcopy(G_i)
-
-        # Topology change first, then mutate attributes on the changed graph.
-        G_prime = _apply_topology_mutation(
-            G_prime,
-            flows_old[i],
-            rng,
-            mutation_info,
-            mutation_policy=mutation_policy,
-        )
-        ranges = _resolve_mutation_ranges(G_prime, mutation_policy)
-        G_prime, attr_changes = mutate_attributes(
-            G_prime,
-            rng,
-            num_attr_change_edges=ranges['num_attr_change_edges'],
-            cap_scale_range=ranges['cap_scale_range'],
-            spd_scale_range=ranges['spd_scale_range'],
-            capacity_bounds=ranges['capacity_bounds'],
-            speed_bounds=ranges['speed_bounds'],
-        )
-        mutation_info['attr_changes'] = attr_changes
-        mutation_info['attr_changes_count'] = len(attr_changes)
-
-        # --- Step 3: Node set consistency check ---
-        # G and G' must have identical node sets; only edge set may change
-        assert set(G_i.nodes()) == set(G_prime.nodes()), (
-            f"Scenario {i}: Node set mismatch between G and G'! G: {set(G_i.nodes())}, G': {set(G_prime.nodes())}"
-        )
-        assert G_prime.number_of_nodes() == num_nodes, (
-            f"Scenario {i}: G' node count {G_prime.number_of_nodes()} does not match expected {num_nodes}!"
+    failure_records = []
+    expected_nodes = set(G_topo.nodes())
+    for sample_idx in tqdm(range(num_samples), desc="  Generating network pairs"):
+        mutation_type = str(mutation_types[sample_idx])
+        scenario_graph = build_scenario_graph(
+            G_topo,
+            capacities[sample_idx],
+            speeds[sample_idx],
         )
 
-        scenario_pairs.append({
-            'od_matrix'    : od_matrices[i].copy(),   # [11, 11], OD matrix (for SUE only)
-            'G'            : G_i,                     # Scenario G (NetworkX DiGraph)
-            'G_prime'      : G_prime,                 # Mutated network G' (NetworkX DiGraph)
-            'mutation_type': mutation_type,
-            'mutation_info': mutation_info,
-            'network_name' : network_name,
-            'node_ids'     : node_ids,
-            'centroid_nodes': centroid_nodes,
-            'node_id_offset': node_id_offset,
-        })
+        try:
+            mutated_graph, mutation_info = _apply_reconfiguration(
+                graph=scenario_graph,
+                mutation_type=mutation_type,
+                rng=rng,
+                policy=policy,
+                od_matrix=od_matrices[sample_idx],
+                centroid_nodes=resolved_centroids,
+            )
+        except ReconfigurationError as exc:
+            failure_records.append(
+                {
+                    "index": sample_idx,
+                    "reason": str(exc),
+                    "mutation_type": mutation_type,
+                }
+            )
+            continue
 
-    # --- Collate stats ---
-    edge_counts_G      = [len(list(p['G'].edges()))       for p in scenario_pairs]
-    edge_counts_Gprime = [len(list(p['G_prime'].edges())) for p in scenario_pairs]
+        if set(mutated_graph.nodes()) != expected_nodes:
+            raise AssertionError(
+                f"Scenario {sample_idx}: G and G_prime must have identical node sets."
+            )
 
-    print(f"\n  Generation complete!")
-    print(f"  G  edge count: fixed at {edge_counts_G[0]} (same in all scenarios)")
-    print(f"  G' edge count: min={min(edge_counts_Gprime)}, "
-          f"max={max(edge_counts_Gprime)}, "
-          f"mean={np.mean(edge_counts_Gprime):.1f}")
+        scenario_pairs.append(
+            {
+                "sample_idx": sample_idx,
+                "od_matrix": od_matrices[sample_idx].copy(),
+                "G": scenario_graph,
+                "G_prime": mutated_graph,
+                "mutation_type": mutation_type,
+                "mutation_info": mutation_info,
+                "network_name": network_name,
+                "node_ids": resolved_node_ids,
+                "centroid_nodes": resolved_centroids,
+                "node_id_offset": node_id_offset,
+            }
+        )
 
-    return scenario_pairs
+    if scenario_pairs:
+        edge_counts = [pair["G_prime"].number_of_edges() for pair in scenario_pairs]
+        print(
+            "  Generation complete: "
+            f"{len(scenario_pairs)} valid, {len(failure_records)} failed; "
+            f"G' edges min={min(edge_counts)}, max={max(edge_counts)}, "
+            f"mean={np.mean(edge_counts):.1f}."
+        )
+    else:
+        print(
+            "  Generation complete: no valid network pairs; "
+            f"{len(failure_records)} mutations failed."
+        )
+
+    return scenario_pairs, failure_records
 
 
-# ============================================================
-# Part 5: Utilities for Saving and Loading
-# ============================================================
-
-def save_scenarios(od_matrices, capacities, speeds, save_path='processed_data/raw/base_scenarios.npz'):
-    """
-    Save LHS base scenario data (numpy format, compact and compressed).
-
-    Args:
-        od_matrices: [N, 11, 11]
-        capacities:  [N, 76]
-        speeds:      [N, 76]
-        save_path:   Target file path (.npz)
-    """
-    import os
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    np.savez_compressed(save_path, od_matrices=od_matrices, capacities=capacities, speeds=speeds)
+def save_scenarios(
+    od_matrices: np.ndarray,
+    capacities: np.ndarray,
+    speeds: np.ndarray,
+    save_path: str = "processed_data/raw/base_scenarios.npz",
+) -> None:
+    """Save compact baseline-perturbed scenario arrays."""
+    os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else ".", exist_ok=True)
+    np.savez_compressed(
+        save_path,
+        od_matrices=od_matrices,
+        capacities=capacities,
+        speeds=speeds,
+    )
     print(f"  Base scenarios saved: {save_path}")
 
 
-def load_scenarios(load_path='processed_data/raw/base_scenarios.npz'):
-    """
-    Load LHS base scenario data.
-
-    Returns:
-        od_matrices, capacities, speeds
-    """
+def load_scenarios(
+    load_path: str = "processed_data/raw/base_scenarios.npz",
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Load baseline-perturbed scenario arrays."""
     data = np.load(load_path)
     print(f"  Base scenarios loaded: {load_path}")
-    return data['od_matrices'], data['capacities'], data['speeds']
+    return data["od_matrices"], data["capacities"], data["speeds"]
 
 
-def save_scenario_pairs(scenario_pairs: list, save_path='processed_data/raw/scenario_pairs.pkl'):
-    """
-    Save (G, G') pair list (includes NetworkX graph objects, serialized with pickle).
-
-    Note: Each scenario_pair contains two NetworkX DiGraph objects, memory intensive.
-    For large datasets (> 5000 samples), consider saving in batches.
-
-    Args:
-        scenario_pairs: list of dict, length = N
-        save_path:      Target file path (.pkl)
-    """
-    import os
-    import pickle
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    with open(save_path, 'wb') as f:
-        pickle.dump(scenario_pairs, f, protocol=pickle.HIGHEST_PROTOCOL)
+def save_scenario_pairs(
+    scenario_pairs: list,
+    save_path: str = "processed_data/raw/scenario_pairs.pkl",
+) -> None:
+    """Serialize NetworkX network-pair dictionaries with pickle."""
+    os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else ".", exist_ok=True)
+    with open(save_path, "wb") as handle:
+        pickle.dump(scenario_pairs, handle, protocol=pickle.HIGHEST_PROTOCOL)
     print(f"  Network pair data saved: {save_path} ({len(scenario_pairs)} pairs)")
 
 
-def load_scenario_pairs(load_path='processed_data/raw/scenario_pairs.pkl') -> list:
-    """
-    Load (G, G') pair list.
-
-    Returns:
-        scenario_pairs: list of dict
-    """
-    import pickle
-    with open(load_path, 'rb') as f:
-        scenario_pairs = pickle.load(f)
+def load_scenario_pairs(
+    load_path: str = "processed_data/raw/scenario_pairs.pkl",
+) -> list:
+    """Load serialized NetworkX network-pair dictionaries."""
+    with open(load_path, "rb") as handle:
+        scenario_pairs = pickle.load(handle)
     print(f"  Network pair data loaded: {load_path} ({len(scenario_pairs)} pairs)")
     return scenario_pairs

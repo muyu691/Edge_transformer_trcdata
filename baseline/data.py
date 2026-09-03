@@ -30,9 +30,10 @@ def canonical_dataset_name(dataset_name: str) -> str:
         "sioux_falls": "siouxfalls",
         "sioux-falls": "siouxfalls",
         "sioux falls": "siouxfalls",
+        "anaheim": "anaheim",
     }
     if key not in aliases:
-        raise ValueError(f"Unsupported dataset_name '{dataset_name}'. Choose from: ema, siouxfalls.")
+        raise ValueError(f"Unsupported dataset_name '{dataset_name}'. Choose from: anaheim, ema, siouxfalls.")
     return aliases[key]
 
 
@@ -113,14 +114,19 @@ def resolve_dataset_dir(
 
     candidate_map = {
         "ema": [
-            "ema_pyg_newpolicy_lhs",
+            "ema_pyg_baseline_perturb",
             "ema_pyg_dataset",
             "pyg_dataset",
         ],
         "siouxfalls": [
-            "siouxfalls_pyg_newpolicy_lhs",
+            "siouxfalls_pyg_baseline_perturb",
             "siouxfalls_pyg_dataset",
             "siouxfalls_pyg",
+        ],
+        "anaheim": [
+            "anaheim_pyg_baseline_perturb",
+            "anaheim_pyg_dataset",
+            "anaheim_pyg",
         ],
     }
     for name in candidate_map[canonical]:

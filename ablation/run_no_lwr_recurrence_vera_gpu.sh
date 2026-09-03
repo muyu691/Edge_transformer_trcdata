@@ -1,15 +1,17 @@
 #!/bin/bash
-# GPU Slurm launcher for the w/o recurrent pressure update ablation on Vera.
+# GPU Slurm launcher for the Edge Transformer w/o recurrent pressure update ablation on Vera.
 
 #SBATCH -J abl_nolwr
-#SBATCH -o logs/abl_nolwr_%j.out
-#SBATCH -e logs/abl_nolwr_%j.err
+#SBATCH -o logs/abl_nolwr_%A_%a.out
+#SBATCH -e logs/abl_nolwr_%A_%a.err
 #SBATCH -t 0-12:00:00
 #SBATCH -n 1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64G
+#SBATCH -A NA
 #SBATCH -p gpu
-#SBATCH --gres=gpu:A40:1
+#SBATCH --gres=gpu:H100:1
+#SBATCH --array=0-2
 
 set -euo pipefail
 
@@ -26,7 +28,13 @@ fi
 source "${PROJECT_ROOT}/ablation/ablation_common.sh"
 CONFIG_PATH="${CONFIG_PATH:-${PROJECT_ROOT}/configs/GatedGCN/network-pairs-topology.yaml}"
 PROCESSED_ROOT="${PROCESSED_ROOT:-${PROJECT_ROOT}/create_sioux_data/processed_data}"
-DATASET_NAME="${DATASET_NAME:-ema}"
+DATASETS=(siouxfalls ema anaheim)
+TASK_ID="${SLURM_ARRAY_TASK_ID:-0}"
+if [[ "${TASK_ID}" -lt 0 || "${TASK_ID}" -ge "${#DATASETS[@]}" ]]; then
+  echo "Invalid SLURM_ARRAY_TASK_ID=${TASK_ID}; expected 0-$((${#DATASETS[@]} - 1))" >&2
+  exit 1
+fi
+DATASET_NAME="${DATASET_NAME:-${DATASETS[$TASK_ID]}}"
 DEVICE_VALUE="${DEVICE_VALUE:-cuda}"
 HIDDEN_DIM="${HIDDEN_DIM:-128}"
 BATCH_SIZE="${BATCH_SIZE:-32}"
@@ -34,7 +42,7 @@ EPOCHS="${EPOCHS:-200}"
 LR_VALUE="${LR_VALUE:-0.001}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-1e-5}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${PROJECT_ROOT}/results/ablation}"
-RUN_TAG="${RUN_TAG:-no_lwr_recurrence_${DATASET_NAME}}"
+RUN_TAG="${RUN_TAG:-ablation_no_lwr_recurrence_${DATASET_NAME}_10000}"
 
 set_ablation_main_hparams
 RESOLVED_DATASET_DIR="$(resolve_ablation_dataset_dir)"
@@ -42,15 +50,25 @@ NETWORK_NAME="$(resolve_ablation_network_name)"
 
 cd "${PROJECT_ROOT}"
 
-echo "=========== W/O Recurrent Pressure Update (Vera GPU) ==========="
-echo "DATASET_NAME   : ${DATASET_NAME}"
-echo "NETWORK_NAME   : ${NETWORK_NAME}"
-echo "DATASET_DIR    : ${RESOLVED_DATASET_DIR}"
-echo "LAMBDA_NEW     : ${LAMBDA_NEW_FINAL}"
-echo "LAMBDA_CON     : ${LAMBDA_CON}"
-echo "RUN_TAG        : ${RUN_TAG}"
-echo "START_TIME     : $(date '+%Y-%m-%d %H:%M:%S')"
-echo "================================================================"
+if [[ ! -f "${RESOLVED_DATASET_DIR}/dataset_meta.json" ]]; then
+  echo "Missing processed dataset: ${RESOLVED_DATASET_DIR}/dataset_meta.json" >&2
+  echo "Set DATASET_DIR explicitly, or generate the ${DATASET_NAME} PyG dataset first." >&2
+  exit 1
+fi
+
+echo "======= Edge Transformer W/O LWR Recurrence (Vera GPU) ======="
+echo "SLURM_JOB_ID        : ${SLURM_JOB_ID:-N/A}"
+echo "SLURM_ARRAY_TASK_ID : ${SLURM_ARRAY_TASK_ID:-N/A}"
+echo "DATASET_NAME        : ${DATASET_NAME}"
+echo "NETWORK_NAME        : ${NETWORK_NAME}"
+echo "DATASET_DIR         : ${RESOLVED_DATASET_DIR}"
+echo "LAMBDA_NEW          : ${LAMBDA_NEW_FINAL}"
+echo "LAMBDA_CON          : ${LAMBDA_CON}"
+echo "CON_SCHEDULE        : ${LAMBDA_CON_SCHEDULE}"
+echo "PRESSURE_MODE       : fixed_initial"
+echo "RUN_TAG             : ${RUN_TAG}"
+echo "START_TIME          : $(date '+%Y-%m-%d %H:%M:%S')"
+echo "=============================================================="
 
 source "${PROJECT_ROOT}/scripts/activate_venv_cuda.sh"
 
@@ -79,14 +97,15 @@ srun python main.py \
   topology_gnn.dropout 0.1 \
   topology_gnn.residual True \
   topology_gnn.num_heads 4 \
-  topology_gnn.local_backbone "gatedgcn" \
+  topology_gnn.local_backbone "edge_transformer" \
+  topology_gnn.num_edge_transformer_layers 1 \
   topology_gnn.ffn_type "swiglu" \
   topology_gnn.ffn_mult "8/3" \
   topology_gnn.norm_type "rmsnorm" \
   topology_gnn.norm_position "pre" \
   topology_gnn.edge_to_node_agg "mean" \
   topology_gnn.edge_endpoint_mode "fusion" \
-  topology_gnn.enable_global_attn True \
+  topology_gnn.enable_global_attn False \
   topology_gnn.init_scheme "default" \
   topology_gnn.init_residual_scale 0.1 \
   topology_gnn.init_delta_scale 0.1 \
