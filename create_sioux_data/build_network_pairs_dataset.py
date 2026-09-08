@@ -24,6 +24,11 @@ from sklearn.preprocessing import StandardScaler
 from torch_geometric.data import Data
 from tqdm import tqdm
 
+try:
+    from solve_network_pairs import validate_sue_certificates
+except ModuleNotFoundError:
+    from .solve_network_pairs import validate_sue_certificates
+
 
 def extract_edge_attrs(G, edge_list: list) -> np.ndarray:
     """Extract [capacity, speed, length] in the canonical edge order."""
@@ -421,7 +426,10 @@ def run(args) -> None:
     else:
         pairs = payload
 
+    validate_sue_certificates(pairs)
     num_samples = len(pairs)
+    if num_samples == 0:
+        raise ValueError("No verified pairs to build; inspect the generation failure records.")
     print(f"  Number of valid network pairs: {num_samples}")
 
     first = pairs[0]

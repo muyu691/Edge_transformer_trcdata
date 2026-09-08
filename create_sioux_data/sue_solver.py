@@ -5,9 +5,7 @@ from scipy.sparse.csgraph import dijkstra
 
 
 EPS = 1e-12
-V_MAX = 1e6
-EXP_CLIP_MIN = -700.0
-EXP_CLIP_MAX = 60.0
+SOLVER_VERSION = "markov_logit_logspace_v3"
 
 
 class SUEConvergenceError(RuntimeError):
@@ -57,7 +55,21 @@ def _build_sparse_edge_incidence(num_nodes, tails, heads):
     return out_mat, in_mat
 
 
-def _compute_reasonable_link_mask(travel_times, tails, heads, num_nodes, dest_nodes):
+def _allowed_link_mask(G, node_ids, dest_nodes):
+    """A non-through zone may emit its own demand, but may only be entered
+    when it is the destination. FIRST THRU NODE=1 leaves TNTP roads unrestricted.
+    """
+    first_thru = int(G.graph.get("first_thru_node", 1))
+    if first_thru <= 1:
+        return np.ones((G.number_of_edges(), len(dest_nodes)), dtype=bool)
+    node_index = {node: i for i, node in enumerate(node_ids)}
+    heads = np.asarray([node_index[v] for _, v in G.edges()])
+    restricted = np.asarray([node < first_thru for node in node_ids])
+    return ~restricted[heads, None] | (heads[:, None] == dest_nodes[None, :])
+
+
+def _compute_reasonable_link_mask(travel_times, tails, heads, num_nodes, dest_nodes,
+                                  allowed_mask=None, od_matrix=None, downhill=True):
     """
     Keep only links that move closer to each destination.
 
@@ -69,38 +81,79 @@ def _compute_reasonable_link_mask(travel_times, tails, heads, num_nodes, dest_no
     num_edges = tails.shape[0]
     tt = np.asarray(travel_times, dtype=np.float64).reshape(num_edges)
 
-    reverse_graph = sp.csr_matrix((tt, (heads, tails)), shape=(num_nodes, num_nodes))
-    dist = dijkstra(
-        csgraph=reverse_graph,
-        directed=True,
-        indices=dest_nodes,
-        return_predecessors=False,
-    )
-    dist = np.atleast_2d(dist).T
+    if allowed_mask is None or np.all(allowed_mask):
+        reverse_graph = sp.csr_matrix((tt, (heads, tails)), shape=(num_nodes, num_nodes))
+        dist = np.atleast_2d(dijkstra(reverse_graph, directed=True, indices=dest_nodes)).T
+    else:
+        # Distances must obey the SAME zone restriction as the probabilities;
+        # masking forbidden links only after shortest paths can strand a zone.
+        dist = np.empty((num_nodes, len(dest_nodes)))
+        for column, destination in enumerate(dest_nodes):
+            keep = allowed_mask[:, column]
+            reverse_graph = sp.csr_matrix(
+                (tt[keep], (heads[keep], tails[keep])), shape=(num_nodes, num_nodes),
+            )
+            dist[:, column] = dijkstra(reverse_graph, directed=True, indices=destination)
 
     tail_dist = dist[tails, :]
     head_dist = dist[heads, :]
-    reasonable = np.isfinite(tail_dist) & np.isfinite(head_dist) & (
-        head_dist < tail_dist - 1e-12
-    )
+    reasonable = np.isfinite(tail_dist) & np.isfinite(head_dist)
+    if downhill:
+        reasonable &= head_dist < tail_dist
     reasonable[tails[:, None] == dest_nodes[None, :]] = False
+    if allowed_mask is not None:
+        reasonable &= allowed_mask
 
-    outgoing = [np.flatnonzero(tails == node) for node in range(num_nodes)]
-    for dest_col, dest_node in enumerate(dest_nodes):
-        for node in range(num_nodes):
-            if node == int(dest_node):
-                continue
-            edge_ids = outgoing[node]
-            if edge_ids.size == 0 or np.any(reasonable[edge_ids, dest_col]):
-                continue
-            finite_edge_ids = edge_ids[np.isfinite(dist[heads[edge_ids], dest_col])]
-            if finite_edge_ids.size == 0:
-                continue
-            scores = tt[finite_edge_ids] + dist[heads[finite_edge_ids], dest_col]
-            best_edge = finite_edge_ids[int(np.argmin(scores))]
-            reasonable[best_edge, dest_col] = True
+    # Never insert a non-downhill fallback edge: it can create a cycle and
+    # silently change the declared choice set. Positive costs imply a downhill
+    # shortest-path successor at every reachable non-destination node.
+    counts = np.zeros((num_nodes, len(dest_nodes)), dtype=np.int64)
+    np.add.at(counts, tails, reasonable)
+    counts[dest_nodes, np.arange(len(dest_nodes))] = 1
+    # A connector leading only into a different zone can legitimately be
+    # unreachable. Only positive-demand OD origins MUST reach this destination.
+    if od_matrix is not None:
+        required = np.asarray(od_matrix) > 0.0
+        np.fill_diagonal(required, False)
+        if np.any(required & (counts[dest_nodes, :] == 0)):
+            raise ValueError("A positive-demand OD has no legal route without zone transit.")
 
     return reasonable
+
+
+def _logit_rows(travel_times, values, tails, heads, out_mat, dest_nodes,
+                theta, reasonable_mask):
+    """Segmented log-sum-exp and softmax, shifted BEFORE exponentiation.
+
+    Rows are (tail node, destination). Absolute utilities are never clipped;
+    only negligible relative probabilities may naturally underflow to zero.
+    Destination rows are absorbing and deliberately have no outgoing mass.
+    """
+    utility = -theta * (travel_times[:, None] + values[heads, :])
+    permitted = tails[:, None] != dest_nodes[None, :]
+    if reasonable_mask is not None:
+        permitted = permitted & reasonable_mask
+    if not np.all(np.isfinite(utility[permitted])):
+        raise FloatingPointError("Non-finite recursive-logit utility on a permitted edge.")
+    utility = np.where(permitted, utility, -np.inf)
+    row_max = np.full(values.shape, -np.inf)
+    np.maximum.at(row_max, tails, utility)
+    safe_max = np.where(np.isfinite(row_max), row_max, 0.0)
+    weights = np.exp(utility - safe_max[tails, :])
+    row_sum = out_mat @ weights
+    reachable = row_sum > 0.0
+    required = (out_mat @ permitted) > 0
+    required[dest_nodes, np.arange(len(dest_nodes))] = False
+    if np.any(required & ~reachable):
+        raise SUEConvergenceError(
+            "A non-destination state has no representable path to its destination.",
+            stage="transition_normalization",
+        )
+    log_sum = safe_max + np.log(np.where(reachable, row_sum, 1.0))
+    updated = -log_sum / theta
+    updated[dest_nodes, np.arange(len(dest_nodes))] = 0.0
+    probabilities = weights / np.where(reachable, row_sum, 1.0)[tails, :]
+    return updated, probabilities
 
 
 def _solve_recursive_logit_values(
@@ -124,28 +177,11 @@ def _solve_recursive_logit_values(
 
     converged = False
     for _ in range(max_iter):
-        # utility_e,d = -theta * (c_e + V_head,d)
-        utility = -theta * (tt[:, None] + V[heads, :])
-        utility = np.clip(utility, EXP_CLIP_MIN, EXP_CLIP_MAX)
-        z = np.exp(utility)  # [E, D]
-        if reasonable_mask is not None:
-            z = z * reasonable_mask
-
-        # S_u,d = sum_{e from u} z_e,d
-        S = out_mat @ z  # [N, D]
-        # EXP_CLIP_MIN keeps every representable, permitted transition
-        # strictly positive.  Using EPS here would incorrectly classify small
-        # but valid probabilities as unreachable and silently discard demand.
-        V_new = -np.log(np.maximum(S, np.finfo(np.float64).tiny)) / theta
-
-        V_new[dest_nodes, np.arange(num_dests)] = 0.0
-
-        unreachable = S <= 0.0
-        if np.any(unreachable):
-            V_new[unreachable] = V_MAX
-            V_new[dest_nodes, np.arange(num_dests)] = 0.0
-
-        rel = np.linalg.norm(V_new - V) / (np.linalg.norm(V) + 1.0)
+        V_new, _ = _logit_rows(tt, V, tails, heads, out_mat, dest_nodes,
+                               theta, reasonable_mask)
+        # Absolute error in log-utility units; dividing by a huge congested
+        # value could hide probability-relevant errors.
+        rel = theta * np.max(np.abs(V_new - V))
         if not np.isfinite(rel) or not np.all(np.isfinite(V_new)):
             raise FloatingPointError("Recursive-logit value iteration produced NaN or Inf.")
         V = V_new
@@ -170,6 +206,9 @@ def _markov_logit_network_loading(
     flow_tol=1e-9,
     loading_protocol="reasonable_links",
     centroid_indices=None,
+    fixed_reasonable_mask=None,
+    return_diagnostics=False,
+    allowed_mask=None,
 ):
     num_nodes = out_mat.shape[0]
     num_edges = tails.shape[0]
@@ -185,17 +224,32 @@ def _markov_logit_network_loading(
         )
     tt = np.asarray(travel_times, dtype=np.float64).reshape(num_edges)
     if loading_protocol in {"reasonable_links", "stable_reasonable_links"}:
-        reasonable_mask = _compute_reasonable_link_mask(
-            travel_times=tt,
-            tails=tails,
-            heads=heads,
-            num_nodes=num_nodes,
-            dest_nodes=dest_nodes,
-        )
-    elif loading_protocol in {"legacy_unrestricted", "stable_unrestricted"}:
+        if fixed_reasonable_mask is None:
+            reasonable_mask = _compute_reasonable_link_mask(
+                travel_times=tt,
+                tails=tails,
+                heads=heads,
+                num_nodes=num_nodes,
+                dest_nodes=dest_nodes,
+                allowed_mask=allowed_mask,
+                od_matrix=od,
+            )
+        else:
+            reasonable_mask = np.asarray(fixed_reasonable_mask, dtype=bool)
+            expected_shape = (num_edges, num_dests)
+            if reasonable_mask.shape != expected_shape:
+                raise ValueError(
+                    "fixed_reasonable_mask must have shape "
+                    f"{expected_shape}, got {reasonable_mask.shape}."
+                )
+    elif loading_protocol == "stable_unrestricted":
         reasonable_mask = None
     else:
         raise ValueError(f"Unsupported SUE loading protocol: {loading_protocol!r}")
+
+    if allowed_mask is not None:
+        reasonable_mask = (allowed_mask if reasonable_mask is None
+                           else reasonable_mask & allowed_mask)
 
     V, value_converged = _solve_recursive_logit_values(
         travel_times=tt,
@@ -209,52 +263,40 @@ def _markov_logit_network_loading(
         tol=value_tol,
     )  # [N, D]
 
-    utility = -theta * (tt[:, None] + V[heads, :])
-    utility = np.clip(utility, EXP_CLIP_MIN, EXP_CLIP_MAX)
-    z = np.exp(utility)  # [E, D]
-    if reasonable_mask is not None:
-        z = z * reasonable_mask
-    S = out_mat @ z      # [N, D]
-    if loading_protocol == "legacy_unrestricted":
-        # Exact loading rule used by datasets created before the reasonable-link
-        # mask was introduced. Keep this branch for dataset reproducibility.
-        p = z / np.maximum(S[tails, :], EPS)
-    elif loading_protocol == "reasonable_links":
-        p = np.zeros_like(z)
-        denom = S[tails, :]
-        valid = denom > 0.0
-        p[valid] = z[valid] / denom[valid]
-    else:
-        # A masked row can have a valid but extremely small denominator.  The
-        # old EPS cutoff silently discarded its OD demand.  Normalize every
-        # representable positive row for a flow-conserving initialization.
-        p = np.zeros_like(z)
-        denom = S[tails, :]
-        valid = denom > 0.0
-        p[valid] = z[valid] / denom[valid]
-
-    is_out_of_dest = tails[:, None] == dest_nodes[None, :]
-    p[is_out_of_dest] = 0.0
-    p = np.clip(p, 0.0, 1.0)
+    checked_values, p = _logit_rows(tt, V, tails, heads, out_mat, dest_nodes,
+                                   theta, reasonable_mask)
+    bellman_residual = float(theta * np.max(np.abs(checked_values - V)))
+    if not value_converged or bellman_residual > value_tol:
+        raise SUEConvergenceError(
+            "Recursive-logit values did not satisfy the Bellman tolerance.",
+            stage="recursive_values",
+            diagnostics={"bellman_residual": bellman_residual,
+                         "value_iter": int(value_iter), "value_tol": float(value_tol)},
+        )
 
     # Every non-destination state must distribute all probability over its
     # outgoing links.  Otherwise the loading can appear converged while OD
     # demand has simply vanished through an underflowed or unreachable row.
     row_probability = out_mat @ p
-    expected_probability = np.ones_like(row_probability)
+    expected_probability = (np.ones_like(row_probability) if reasonable_mask is None
+                            else ((out_mat @ reasonable_mask) > 0).astype(float))
     expected_probability[dest_nodes, np.arange(num_dests)] = 0.0
+    transition_error = float(np.max(np.abs(row_probability - expected_probability)))
     transition_converged = bool(
         np.all(np.isfinite(row_probability))
-        and np.max(np.abs(row_probability - expected_probability)) <= 1e-8
+        and transition_error <= 1e-12
     )
 
     q = np.zeros((num_nodes, num_dests), dtype=np.float64)
     q[dest_nodes, :] = od
     q[dest_nodes, np.arange(num_dests)] = 0.0
+    if np.any((q > 0.0) & (expected_probability == 0.0)):
+        raise SUEConvergenceError("Positive demand has no legal destination-reaching route.",
+                                  stage="od_reachability")
 
     x = q.copy()  
     loading_converged = False
-    for _ in range(flow_iter):
+    for loading_iteration in range(1, flow_iter + 1):
         edge_flow_by_dest = x[tails, :] * p        # [E, D]
         x_new = q + (in_mat @ edge_flow_by_dest)   # [N, D]
 
@@ -273,13 +315,37 @@ def _markov_logit_network_loading(
             break
 
     edge_flow_by_dest = x[tails, :] * p
+    incoming = in_mat @ edge_flow_by_dest
+    outgoing = out_mat @ edge_flow_by_dest
+    demand = od.sum(axis=0) - np.diag(od)
+    arrivals = incoming[dest_nodes, np.arange(num_dests)]
+    arrival_error = float(np.max(np.abs(arrivals - demand) / np.maximum(demand, 1.0)))
+    balance = outgoing - incoming - q
+    balance[dest_nodes, np.arange(num_dests)] += demand
+    balance_error = float(np.max(np.abs(balance) / np.maximum(demand[None, :], 1.0)))
+    state_residual = float(np.linalg.norm(q + incoming - x) / (np.linalg.norm(x) + 1.0))
+    diagnostics = {
+        "bellman_residual": bellman_residual,
+        "transition_error": transition_error,
+        "flow_loading_iterations": loading_iteration,
+        "flow_loading_residual": state_residual,
+        "destination_arrival_error": arrival_error,
+        "destination_balance_error": balance_error,
+    }
+    if not (transition_converged and loading_converged
+            and max(arrival_error, balance_error, state_residual) <= flow_tol):
+        raise SUEConvergenceError(
+            "Markov loading failed probability, flow-balance, or destination-arrival checks.",
+            stage="flow_loading", diagnostics=diagnostics,
+        )
     flows = np.sum(edge_flow_by_dest, axis=1)  # [E]
     if not np.all(np.isfinite(flows)):
         raise FloatingPointError("Markov network loading produced NaN or Inf edge flow.")
     if np.any(flows < -EPS):
         raise FloatingPointError("Markov network loading produced negative edge flow.")
     loading_converged = bool(value_converged and transition_converged and loading_converged)
-    return np.maximum(flows, 0.0), loading_converged
+    result = (np.maximum(flows, 0.0), loading_converged)
+    return (*result, diagnostics) if return_diagnostics else result
 
 
 def _relative_gap(flows, aux_flows, travel_times):
@@ -311,7 +377,10 @@ def _msa_sr_step(iteration, flow_gap, prev_flow_gap, beta=1.2, gamma=0.72):
         elif ratio < 0.70:
             alpha *= 1.08
 
-    return float(np.clip(alpha, 0.02, 0.80))
+    # A positive hard floor prevents the MSA sequence from tending to zero and
+    # can sustain a fixed-point oscillation.  Keep only the upper safeguard;
+    # alpha is strictly positive for every finite iteration.
+    return float(min(alpha, 0.80))
 
 
 def _residual_aware_step(
@@ -385,6 +454,8 @@ def _prepare_solver_inputs(
 
     od = np.asarray(od_matrix, dtype=np.float64)
     num_centroids = len(centroid_nodes)
+    if num_centroids == 0:
+        raise ValueError("centroid_nodes must not be empty.")
     if od.shape != (num_centroids, num_centroids):
         raise ValueError(
             f"od_matrix must have shape ({num_centroids}, {num_centroids}), got {od.shape}."
@@ -443,9 +514,11 @@ def markov_logit_sue_solver(
     residual_step_exponent=0.5,
     residual_step_min=0.02,
     residual_step_max=0.80,
-    stop_before_update=False,
+    stop_before_update=True,
     step_warmup_iters=0,
     step_warmup_max=1.0,
+    verify_only=False,
+    secant_safeguard=True,
 ):
     if max_iter <= 0 or value_iter <= 0 or flow_iter <= 0:
         raise ValueError("max_iter, value_iter, and flow_iter must be positive.")
@@ -457,6 +530,15 @@ def markov_logit_sue_solver(
         raise ValueError("flow_tol must be finite and positive.")
     if not np.isfinite(theta) or theta <= 0.0:
         raise ValueError("theta must be finite and positive.")
+    supported_protocols = {"reasonable_links", "stable_reasonable_links", "stable_unrestricted"}
+    for protocol in (loading_protocol, initial_loading_protocol or loading_protocol):
+        if protocol not in supported_protocols:
+            raise ValueError(
+                f"Unsupported SUE loading protocol {protocol!r}. The unsafe legacy "
+                "EPS/clipping loader is retired; use an explicit supported protocol."
+            )
+    if verify_only and (initial_flows is None or initial_flow_mode != "direct"):
+        raise ValueError("verify_only requires an unchanged, direct initial_flows array.")
     network_loading_calls = 0
     negative_initial_flow_count = 0
     if initial_flow_mode not in {"direct", "cost_loaded"}:
@@ -480,6 +562,36 @@ def markov_logit_sue_solver(
     num_edges = len(edges)
     num_nodes = G.number_of_nodes()
     out_mat, in_mat = _build_sparse_edge_incidence(num_nodes, tails, heads)
+    allowed_mask = _allowed_link_mask(G, node_ids, centroid_indices)
+    if not np.all(allowed_mask):
+        # Prune destination-unreachable connector states for both protocols.
+        allowed_mask = _compute_reasonable_link_mask(
+            t0, tails, heads, num_nodes, centroid_indices,
+            allowed_mask=allowed_mask, od_matrix=od, downhill=False,
+        )
+
+    # Freeze the destination-specific reasonable-link choice set for the whole
+    # outer solve.  Recomputing this discrete mask from congested costs at every
+    # iteration makes the fixed-point map discontinuous: links can repeatedly
+    # enter and leave the choice set near equilibrium, so a strict tolerance may
+    # be impossible to satisfy.  Free-flow costs provide a scenario-specific,
+    # flow-independent set. This is explicitly a fixed-free-flow choice-set
+    # model, not the old dynamically reselected mask or unrestricted SUE.
+    fixed_reasonable_mask = None
+    reasonable_protocols = {"reasonable_links", "stable_reasonable_links"}
+    if (
+        loading_protocol in reasonable_protocols
+        or resolved_initial_loading_protocol in reasonable_protocols
+    ):
+        fixed_reasonable_mask = _compute_reasonable_link_mask(
+            travel_times=t0,
+            tails=tails,
+            heads=heads,
+            num_nodes=num_nodes,
+            dest_nodes=centroid_indices,
+            allowed_mask=allowed_mask,
+            od_matrix=od,
+        )
 
     if initial_flows is None:
         initialization = "free_flow_loading"
@@ -497,6 +609,8 @@ def markov_logit_sue_solver(
             flow_tol=flow_tol,
             loading_protocol=resolved_initial_loading_protocol,
             centroid_indices=centroid_indices,
+            fixed_reasonable_mask=fixed_reasonable_mask,
+            allowed_mask=allowed_mask,
         )
         network_loading_calls += 1
         if not loading_converged:
@@ -519,6 +633,8 @@ def markov_logit_sue_solver(
         if not np.all(np.isfinite(guidance_flows)):
             raise ValueError("initial_flows contains NaN or Inf.")
         negative_initial_flow_count = int(np.count_nonzero(guidance_flows < 0.0))
+        if verify_only and negative_initial_flow_count:
+            raise ValueError("Cannot verify a label containing negative flows.")
         guidance_flows = np.maximum(guidance_flows, 0.0)
 
         if initial_flow_mode == "direct":
@@ -547,6 +663,8 @@ def markov_logit_sue_solver(
                 flow_tol=flow_tol,
                 loading_protocol=resolved_initial_loading_protocol,
                 centroid_indices=centroid_indices,
+                fixed_reasonable_mask=fixed_reasonable_mask,
+                allowed_mask=allowed_mask,
             )
             network_loading_calls += 1
             if not loading_converged:
@@ -568,9 +686,12 @@ def markov_logit_sue_solver(
     iterations = 0
     initial_flow_gap = np.nan
     initial_cost_gap = np.nan
-    final_update_gap = np.inf
+    final_update_gap = 0.0  # No outer update has been performed yet.
     step_sizes = []
-    for it in range(1, max_iter + 1):
+    previous_state = None
+    previous_residual = None
+    safeguarded_steps = 0
+    for it in range(1, 1 if verify_only else max_iter + 1):
         iterations = it
         travel_times = bpr_travel_time(flows, cap, t0, alpha=bpr_alpha, beta=bpr_beta)
 
@@ -588,6 +709,8 @@ def markov_logit_sue_solver(
             flow_tol=flow_tol,
             loading_protocol=loading_protocol,
             centroid_indices=centroid_indices,
+            fixed_reasonable_mask=fixed_reasonable_mask,
+            allowed_mask=allowed_mask,
         )
         network_loading_calls += 1
         if not loading_converged:
@@ -607,12 +730,12 @@ def markov_logit_sue_solver(
         if it == 1:
             initial_flow_gap = float(flow_gap)
             initial_cost_gap = float(cost_gap)
-        if stop_before_update and max(flow_gap, cost_gap) <= convergence_threshold:
+        if (stop_before_update or it > 1) and max(flow_gap, cost_gap) <= convergence_threshold:
             # The current state is already a fixed point to the requested
             # tolerance.  Do not overwrite a converged warm start merely to
-            # perform a nominal outer update.
+            # perform a nominal outer update. When stop_before_update=False,
+            # require one update, then check its result at the next loading.
             iterations = it - 1
-            final_update_gap = 0.0
             outer_candidate_converged = True
             if verbose:
                 print(
@@ -632,6 +755,21 @@ def markov_logit_sue_solver(
                 min_step=residual_step_min,
                 max_step=residual_step_max,
             )
+        # BPR can make the residual extremely sensitive after a closure. A
+        # secant estimate caps the step when the current MSA schedule is too
+        # aggressive, using existing loadings only. This is a numerical
+        # safeguard, not a convergence proof; final verification remains mandatory.
+        residual = aux_flows - flows
+        if secant_safeguard and previous_state is not None:
+            state_change = np.linalg.norm(flows - previous_state)
+            residual_change = np.linalg.norm(residual - previous_residual)
+            if residual_change > 0.0 and state_change > 0.0:
+                cap_step = 0.8 * state_change / residual_change
+                if cap_step < step:
+                    step = float(cap_step)
+                    safeguarded_steps += 1
+        previous_state = flows.copy()
+        previous_residual = residual.copy()
         if it <= step_warmup_iters:
             step = min(step, step_warmup_max)
         step_sizes.append(step)
@@ -656,11 +794,8 @@ def markov_logit_sue_solver(
                 f"flow_gap={flow_gap:.6e} | cost_gap={cost_gap:.6e} | update_gap={update_gap:.6e}"
             )
 
-        if max(flow_gap, cost_gap, update_gap) <= convergence_threshold:
-            outer_candidate_converged = True
-            if verbose:
-                print(f"  SUE converged at iter {it}, gap={max(flow_gap, cost_gap, update_gap):.3e}")
-            break
+        # Pre-update gaps cannot certify new_flows. The next iteration (or the
+        # final verification at the budget limit) must load the updated state.
 
     # Verify the returned state itself, rather than accepting residuals that
     # were measured before the final outer update.
@@ -671,7 +806,7 @@ def markov_logit_sue_solver(
         alpha=bpr_alpha,
         beta=bpr_beta,
     )
-    final_aux_flows, final_loading_converged = _markov_logit_network_loading(
+    final_aux_flows, final_loading_converged, loading_diagnostics = _markov_logit_network_loading(
         travel_times=final_travel_times,
         od_matrix=od,
         tails=tails,
@@ -685,6 +820,9 @@ def markov_logit_sue_solver(
         flow_tol=flow_tol,
         loading_protocol=loading_protocol,
         centroid_indices=centroid_indices,
+        fixed_reasonable_mask=fixed_reasonable_mask,
+        allowed_mask=allowed_mask,
+        return_diagnostics=True,
     )
     network_loading_calls += 1
     if not final_loading_converged:
@@ -705,9 +843,18 @@ def markov_logit_sue_solver(
         final_aux_flows,
         final_travel_times,
     )
-    final_metric = float(max(final_flow_gap, final_cost_gap, final_update_gap))
-    converged = bool(np.isfinite(final_metric) and final_metric <= convergence_threshold)
+    net_demand = np.zeros(num_nodes)
+    net_demand[centroid_indices] = od.sum(axis=1) - od.sum(axis=0)
+    balance = out_mat @ flows - in_mat @ flows - net_demand
+    conservation_error = float(np.max(np.abs(balance)) / max(float(od.sum()), 1.0))
+    # Fixed-point residual is the acceptance criterion. Last-update magnitude
+    # is recorded honestly as a diagnostic, not overwritten on early exit.
+    final_metric = float(max(final_flow_gap, final_cost_gap))
+    converged = bool(np.isfinite(final_metric) and final_metric <= convergence_threshold
+                     and conservation_error <= flow_tol)
     diagnostics = {
+        "solver_version": SOLVER_VERSION,
+        "first_thru_node": int(G.graph.get("first_thru_node", 1)),
         "converged": bool(converged),
         "outer_candidate_converged": bool(outer_candidate_converged),
         "final_fixed_point_verified": bool(converged),
@@ -720,12 +867,30 @@ def markov_logit_sue_solver(
         "final_cost_gap": float(final_cost_gap),
         "final_update_gap": float(final_update_gap),
         "final_convergence_metric": final_metric,
+        "final_conservation_error": conservation_error,
+        "final_conservation_max_abs": float(np.max(np.abs(balance))),
+        "convergence_threshold": float(convergence_threshold),
+        "theta": float(theta),
+        "bpr_alpha": float(bpr_alpha),
+        "bpr_beta": float(bpr_beta),
+        "value_tol": float(value_tol),
+        "flow_tol": float(flow_tol),
+        "value_iter": int(value_iter),
+        "flow_iter": int(flow_iter),
+        "max_iter": int(max_iter),
+        "verification_only": bool(verify_only),
+        "loading_diagnostics": loading_diagnostics,
         "loading_warning_count": 0,
         "negative_initial_flow_count": int(negative_initial_flow_count),
         "loading_protocol": loading_protocol,
+        "reasonable_link_basis": (
+            "free_flow_time" if loading_protocol in reasonable_protocols else None
+        ),
         "initial_flow_mode": initialization,
         "initial_loading_protocol": resolved_initial_loading_protocol,
         "step_rule": step_rule,
+        "secant_safeguard": bool(secant_safeguard),
+        "safeguarded_steps": int(safeguarded_steps),
         "initial_step_size": float(step_sizes[0]) if step_sizes else 0.0,
         "mean_step_size": float(np.mean(step_sizes)) if step_sizes else 0.0,
         "residual_step_exponent": float(residual_step_exponent),
@@ -742,12 +907,23 @@ def markov_logit_sue_solver(
             (
                 "Markov-logit SUE did not satisfy the final fixed-point tolerance: "
                 f"flow_gap={final_flow_gap:.6e}, cost_gap={final_cost_gap:.6e}, "
-                f"update_gap={final_update_gap:.6e}, threshold={convergence_threshold:.6e}."
+                f"update_gap={final_update_gap:.6e}, threshold={convergence_threshold:.6e}, "
+                f"conservation_error={conservation_error:.6e}."
             ),
             stage="final_fixed_point",
             diagnostics=diagnostics,
         )
     return (flows, diagnostics) if return_diagnostics else flows
+
+
+def verify_sue_solution(G, od_matrix, capacities, free_flow_times, flows, **params):
+    """Revalidate an existing label under current equations; never update it."""
+    _, diagnostics = markov_logit_sue_solver(
+        G, od_matrix, capacities, free_flow_times, initial_flows=flows,
+        verify_only=True, return_diagnostics=True, verbose=False, **params,
+    )
+    diagnostics.pop("initial_state_flows", None)
+    return diagnostics
 
 
 def save_flows(flows, save_path='processed_data/raw/flows.npz'):

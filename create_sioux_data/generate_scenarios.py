@@ -20,12 +20,25 @@ from tqdm import tqdm
 
 try:
     from network_registry import MutationPolicy
+    from sue_solver import _allowed_link_mask, _compute_reasonable_link_mask
 except ModuleNotFoundError:
     from .network_registry import MutationPolicy
+    from .sue_solver import _allowed_link_mask, _compute_reasonable_link_mask
 
 
 class ReconfigurationError(RuntimeError):
     """Raised when a requested reconfiguration cannot be applied safely."""
+
+
+def _road_graph(graph: nx.DiGraph) -> nx.DiGraph:
+    """Exclude zone connectors only where TNTP declares non-through zones.
+
+    Return the original graph for FIRST THRU NODE=1, preserving its traversal
+    order and seeded generation behaviour for SiouxFalls and EMA.
+    """
+    first_thru = int(graph.graph.get("first_thru_node", 1))
+    return (graph if first_thru <= 1 else
+            graph.subgraph(node for node in graph if node >= first_thru))
 
 
 def _validate_positive_edge_attributes(graph: nx.DiGraph) -> None:
@@ -63,6 +76,7 @@ def generate_baseline_perturbed_scenarios(
     ``[0.90, 1.10]`` and ``[0.95, 1.05]`` respectively.  Length is never
     sampled; it remains stored on ``baseline_graph`` and is reused later by
     :func:`build_scenario_graph`.
+    Non-through zone connectors retain their baseline capacity and speed.
 
     The three returned arrays intentionally retain the existing downstream
     shapes: ``[N, C, C]``, ``[N, E]``, and ``[N, E]``.
@@ -91,6 +105,8 @@ def generate_baseline_perturbed_scenarios(
         [baseline_graph[u][v]["speed"] for u, v in edges],
         dtype=np.float64,
     )
+    road_edges = _road_graph(baseline_graph).edges
+    connectors = np.asarray([edge not in road_edges for edge in edges], dtype=bool)
 
     num_centroids = int(base_od.shape[0])
     num_edges = len(edges)
@@ -128,6 +144,9 @@ def generate_baseline_perturbed_scenarios(
             1.05,
             size=num_edges,
         )
+        # Keep the RNG draw sequence unchanged; only freeze connector values.
+        capacities[sample_idx, connectors] = baseline_capacities[connectors]
+        speeds[sample_idx, connectors] = baseline_speeds[connectors]
 
     return od_matrices, capacities, speeds
 
@@ -192,12 +211,12 @@ def mutate_closure(
     if not ratios or any(not np.isfinite(value) or value <= 0.0 or value > 1.0 for value in ratios):
         raise ValueError("closure_ratios must contain values in (0, 1].")
 
-    candidates = [(u, v) for u, v in graph.edges() if u != v]
+    candidates = [(u, v) for u, v in _road_graph(graph).edges() if u != v]
     if not candidates:
         raise ReconfigurationError("Closure failed: the graph has no non-self-loop edge.")
 
     requested_ratio = float(rng.choice(np.asarray(ratios, dtype=np.float64)))
-    requested_count = _ratio_count(graph.number_of_edges(), requested_ratio)
+    requested_count = _ratio_count(len(candidates), requested_ratio)
     preserve_strong_connectivity = nx.is_strongly_connected(graph)
     reachable_od_pairs = (
         tuple()
@@ -225,6 +244,24 @@ def mutate_closure(
             )
 
         if remains_valid:
+            if int(trial.graph.get("first_thru_node", 1)) > 1:
+                # Full-graph connectivity alone may rely on an illegal shortcut
+                # through a zone. Reuse the solver's legal-path check.
+                nodes = tuple(trial.nodes())
+                lookup = {node: i for i, node in enumerate(nodes)}
+                edges = list(trial.edges())
+                destinations = np.asarray([lookup[node] for node in centroid_nodes])
+                try:
+                    _compute_reasonable_link_mask(
+                        np.asarray([trial[a][b]["free_flow_time"] for a, b in edges]),
+                        np.asarray([lookup[a] for a, _ in edges]),
+                        np.asarray([lookup[b] for _, b in edges]),
+                        len(nodes), destinations,
+                        allowed_mask=_allowed_link_mask(trial, nodes, destinations),
+                        od_matrix=od_matrix,
+                    )
+                except ValueError:
+                    continue
             mutated.remove_edge(u, v)
             deleted_edges.append((int(u), int(v)))
 
@@ -266,7 +303,7 @@ def mutate_capacity_change(
     ):
         raise ValueError("Capacity scale ranges must be ordered and strictly positive.")
 
-    edges = list(graph.edges())
+    edges = list(_road_graph(graph).edges())
     requested_count = _ratio_count(len(edges), edge_ratio)
     if requested_count == 0:
         raise ReconfigurationError("Capacity change failed: the graph has no edge.")
@@ -318,6 +355,9 @@ def _topology_local_candidates(
         raise ValueError("new_link_hop_range must be an ordered pair of positive integers.")
     min_hops, max_hops = hops
 
+    # Search the road-only subgraph, not the full graph followed by a filter:
+    # this also discovers legal alternatives to shortest paths through zones.
+    graph = _road_graph(graph)
     candidates = []
     for source in graph.nodes():
         paths = nx.single_source_shortest_path(graph, source, cutoff=max_hops)
@@ -358,7 +398,7 @@ def mutate_new_link(
 
     requested_count = min(
         max_new_links,
-        max(1, int(round(edge_ratio * graph.number_of_edges()))),
+        max(1, int(round(edge_ratio * _road_graph(graph).number_of_edges()))),
     )
     candidates = _topology_local_candidates(graph, hop_range)
     if not candidates:
@@ -453,10 +493,16 @@ def build_scenario_graph(
         raise ValueError("Scenario capacities and speeds must be finite and positive.")
 
     scenario_graph = deepcopy(baseline_graph)
+    first_thru = int(baseline_graph.graph.get("first_thru_node", 1))
     for edge_idx, (u, v) in enumerate(edges):
         length = float(baseline_graph[u][v]["length"])
         speed = float(speeds_i[edge_idx])
         capacity = float(capacities_i[edge_idx])
+        if first_thru > 1 and (u < first_thru or v < first_thru):
+            if (capacity != float(baseline_graph[u][v]["capacity"])
+                    or speed != float(baseline_graph[u][v]["speed"])):
+                raise ValueError("Cached zone connectors were perturbed; regenerate scenarios in a new directory.")
+            continue  # Preserve ALL connector attributes, including exact TNTP t0.
         free_flow_time = length / speed * 60.0
         if not np.isfinite(free_flow_time) or free_flow_time <= 0.0:
             raise ValueError(f"Edge {(u, v)} has invalid scenario free-flow time.")

@@ -32,12 +32,19 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from network_registry import resolve_network_spec  # noqa: E402
 from solve_network_pairs import (  # noqa: E402
+    _compact_diagnostics,
+    _bind_pair_certificates,
     _save_final_dataset,
+    _verify_cached_flow,
+    _verify_completed_pair,
+    validate_sue_certificates,
     generate_network_pairs,
     load_network_data,
     load_scenarios,
+    run_first_sue_solve,
     solve_single_graph_sue,
 )
+from sue_solver import SOLVER_VERSION, SUEConvergenceError  # noqa: E402
 
 
 def _od_key(od_matrix: np.ndarray) -> tuple:
@@ -75,9 +82,7 @@ def _recover_completed_by_index(
     od_to_index: dict[tuple, int] = {}
     for idx, od_matrix in enumerate(od_matrices):
         key = _od_key(od_matrix)
-        if key in od_to_index:
-            raise ValueError("Duplicate OD matrix key found; cannot infer checkpoint indices safely.")
-        od_to_index[key] = idx
+        od_to_index[key] = -1 if key in od_to_index else idx
 
     completed_by_index: dict[int, dict[str, Any]] = {}
     unmatched = 0
@@ -87,9 +92,15 @@ def _recover_completed_by_index(
         else:
             key = _od_key(pair["od_matrix"])
             idx = od_to_index.get(key, -1)
-        if idx < 0:
+            if key in od_to_index and idx == -1:
+                raise ValueError("Ambiguous duplicate OD: legacy checkpoint needs explicit sample_idx.")
+        if idx < 0 or idx >= len(od_matrices):
             unmatched += 1
             continue
+        if _od_key(pair["od_matrix"]) != _od_key(od_matrices[idx]):
+            raise ValueError(f"Checkpoint sample_idx={idx} points to a different OD matrix.")
+        if idx in completed_by_index:
+            raise ValueError(f"Duplicate checkpoint sample_idx={idx}.")
         pair["sample_idx"] = idx
         completed_by_index[idx] = pair
 
@@ -100,11 +111,16 @@ def _recover_completed_by_index(
 
 def _build_completed_pair(sample_idx: int, pair: dict[str, Any], solver_params: dict[str, Any]) -> dict[str, Any]:
     G_prime = pair["G_prime"]
-    flows_new, retried, used_flow_iter = solve_single_graph_sue(
+    old_diagnostic = _verify_cached_flow(
+        pair["G"], pair["od_matrix"], pair["flows_old"], solver_params,
+        node_ids=pair["node_ids"], centroid_nodes=pair["centroid_nodes"],
+    )
+    flows_new, retried, used_flow_iter, new_diagnostic = solve_single_graph_sue(
         G_prime,
         pair["od_matrix"],
         node_ids=pair.get("node_ids"),
         centroid_nodes=pair.get("centroid_nodes"),
+        return_diagnostics=True,
         **solver_params,
     )
     edge_list_old = list(pair["G"].edges())
@@ -124,7 +140,10 @@ def _build_completed_pair(sample_idx: int, pair: dict[str, Any], solver_params: 
         "node_ids": tuple(pair.get("node_ids", tuple(sorted(pair["G"].nodes())))),
         "centroid_nodes": tuple(pair.get("centroid_nodes", tuple())),
         "node_id_offset": pair.get("node_id_offset", 1),
+        "sue_diagnostics_old": pair.get("sue_diagnostics_old", old_diagnostic),
+        "sue_diagnostics_new": _compact_diagnostics(new_diagnostic),
     }
+    _bind_pair_certificates(completed_pair)
     return {
         "index": int(sample_idx),
         "pair": completed_pair,
@@ -151,6 +170,8 @@ def _solve_entry(
                 "retried": False,
                 "used_flow_iter": int(solver_params.get("flow_iter", 0)),
                 "error": repr(exc),
+                "solver_stage": getattr(exc, "stage", "input_or_runtime"),
+                "diagnostics": _compact_diagnostics(getattr(exc, "diagnostics", {})),
                 "mutation_type": pair.get("mutation_type", "unknown"),
             }
         )
@@ -163,16 +184,20 @@ def _save_resume_checkpoint(
     base_path: Path,
     processed_count: int,
 ) -> None:
-    path = Path(f"{base_path}.resume_{processed_count}.pkl")
+    path = base_path
     pairs = [completed_by_index[i] for i in sorted(completed_by_index)]
+    validate_sue_certificates(pairs)
     payload = {
+        "solver_version": SOLVER_VERSION,
         "completed_pairs": pairs,
         "failed_indices": sorted(failed_indices),
         "failure_records": list(failure_records),
     }
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("wb") as handle:
+    temporary = Path(str(path) + ".tmp")
+    with temporary.open("wb") as handle:
         pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(temporary, path)
     print(f"\n[Resume checkpoint] saved {len(pairs)} pairs to {path}", flush=True)
 
 
@@ -193,6 +218,7 @@ def solve_missing_with_timeouts(
     result_queue = ctx.Queue()
     pending = list(missing_indices)
     running: dict[int, tuple[Any, float]] = {}
+    exited_without_result = {}
     processed_missing = 0
 
     progress = tqdm(total=len(missing_indices), desc="Resume second SUE")
@@ -222,8 +248,10 @@ def solve_missing_with_timeouts(
             consumed = True
             idx = int(result["index"])
             proc_start = running.pop(idx, None)
-            if proc_start is not None:
-                proc_start[0].join(timeout=1)
+            if proc_start is None:
+                continue  # A late result must not resurrect a timed-out task.
+            proc_start[0].join(timeout=1)
+            exited_without_result.pop(idx, None)
 
             if result["error"]:
                 failed_indices.add(idx)
@@ -233,15 +261,19 @@ def solve_missing_with_timeouts(
                         "stage": "new_sue",
                         "reason": result["error"],
                         "mutation_type": result["mutation_type"],
+                        "solver_stage": result.get("solver_stage"),
+                        "diagnostics": result.get("diagnostics", {}),
                     }
                 )
                 print(f"\n[Failed] sample {idx}: {result['error']}", flush=True)
             else:
                 completed_by_index[idx] = result["pair"]
+                failed_indices.discard(idx)
+                failure_records[:] = [r for r in failure_records if int(r["index"]) != idx]
                 if result["retried"]:
                     print(
                         f"\n[Retry succeeded] sample {idx} accepted after stronger "
-                        f"Markov-logit limits (flow_iter={result['used_flow_iter']}).",
+                        "Markov-logit iteration limits.",
                         flush=True,
                     )
 
@@ -260,20 +292,27 @@ def solve_missing_with_timeouts(
         now = time.monotonic()
         timed_out = []
         for idx, (proc, start) in list(running.items()):
-            if timeout_sec > 0 and now - start > timeout_sec:
+            if proc.exitcode is not None:
+                exited_without_result.setdefault(idx, now)
+            lost_result = idx in exited_without_result and now - exited_without_result[idx] >= 2.0
+            if lost_result or (timeout_sec > 0 and now - start > timeout_sec):
+                reason = (f"Worker exited with code {proc.exitcode} without returning a result."
+                          if lost_result else f"Solver exceeded timeout_sec={timeout_sec}.")
                 timed_out.append(idx)
-                proc.terminate()
+                if proc.is_alive():
+                    proc.terminate()
                 proc.join(timeout=10)
                 if proc.is_alive():
                     proc.kill()
                     proc.join(timeout=5)
                 running.pop(idx, None)
+                exited_without_result.pop(idx, None)
                 failed_indices.add(idx)
                 failure_records.append(
                     {
                         "index": idx,
                         "stage": "new_sue",
-                        "reason": f"Solver exceeded timeout_sec={timeout_sec}.",
+                        "reason": reason,
                         "mutation_type": scenario_pairs_by_index[idx].get(
                             "mutation_type", "unknown"
                         ),
@@ -281,7 +320,7 @@ def solve_missing_with_timeouts(
                 )
                 processed_missing += 1
                 progress.update(1)
-                print(f"\n[Timeout] sample {idx} exceeded {timeout_sec}s and was marked failed.", flush=True)
+                print(f"\n[Worker failed] sample {idx}: {reason}", flush=True)
                 launch_next()
 
         if timed_out and checkpoint_interval > 0:
@@ -296,19 +335,22 @@ def solve_missing_with_timeouts(
             time.sleep(2)
 
     progress.close()
-    _save_resume_checkpoint(
-        completed_by_index,
-        failed_indices,
-        failure_records,
-        checkpoint_path,
-        processed_missing,
-    )
+    result_queue.close()
+    result_queue.join_thread()
+    if checkpoint_interval > 0:
+        _save_resume_checkpoint(
+            completed_by_index,
+            failed_indices,
+            failure_records,
+            checkpoint_path,
+            processed_missing,
+        )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Resume second-SUE network-pair generation from checkpoint.")
     parser.add_argument("--network_name", default="Anaheim")
-    parser.add_argument("--dataset_root", default="../anaheim_data")
+    parser.add_argument("--dataset_root", default="")
     parser.add_argument("--network_file", default="")
     parser.add_argument("--od_file", default="")
     parser.add_argument("--parser", default="tntp")
@@ -326,12 +368,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--flow_iter", type=int, default=500)
     parser.add_argument("--flow_tol", type=float, default=1e-9)
     parser.add_argument("--retry_flow_iter", type=int, default=2000)
-    parser.add_argument("--retry_max_iter", type=int, default=300)
+    parser.add_argument("--retry_max_iter", type=int, default=5000)
     parser.add_argument("--retry_value_iter", type=int, default=500)
     parser.add_argument(
         "--sue_loading_protocol",
         default="reasonable_links",
-        choices=["stable_unrestricted", "reasonable_links", "legacy_unrestricted"],
+        choices=["stable_unrestricted", "reasonable_links"],
     )
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--timeout_sec", type=int, default=3600)
@@ -369,6 +411,27 @@ def main() -> None:
             f"Resume files do not match num_samples={args.num_samples}: "
             f"od={od_matrices.shape}, flows_old={flows_old.shape}"
         )
+    solver_params = {
+        "max_iter": args.max_iter,
+        "convergence_threshold": args.convergence_threshold,
+        "theta": args.theta,
+        "value_iter": args.value_iter,
+        "value_tol": args.value_tol,
+        "flow_iter": args.flow_iter,
+        "flow_tol": args.flow_tol,
+        "retry_flow_iter": args.retry_flow_iter,
+        "retry_max_iter": args.retry_max_iter,
+        "retry_value_iter": args.retry_value_iter,
+        "loading_protocol": args.sue_loading_protocol,
+    }
+    # Finite historical values are not evidence of convergence. Recheck old
+    # labels under current equations and repair invalid rows before resuming.
+    flows_old, old_failures, old_diagnostics = run_first_sue_solve(
+        G_topo, od_matrices, capacities, speeds,
+        node_ids=network_data.node_ids, centroid_nodes=network_data.centroid_nodes,
+        existing_flows=flows_old, num_workers=args.num_workers, **solver_params,
+    )
+    np.save(flows_old_path, flows_old)
 
     print("=" * 72)
     print("Resume network-pair generation")
@@ -403,11 +466,25 @@ def main() -> None:
             invalid_old_indices.add(idx)
             continue
         pair["flows_old"] = flow_row.copy()
+        pair["sue_diagnostics_old"] = old_diagnostics[idx]
         scenario_pairs_by_index[idx] = pair
 
     checkpoint_pairs, checkpoint_failed, failure_records = _load_checkpoint(checkpoint_path)
-    completed_by_index = _recover_completed_by_index(checkpoint_pairs, od_matrices)
-    failed_indices = set(int(i) for i in checkpoint_failed)
+    recovered = _recover_completed_by_index(checkpoint_pairs, od_matrices)
+    completed_by_index = {}
+    for idx, saved in recovered.items():
+        if idx not in scenario_pairs_by_index:
+            continue
+        try:
+            completed_by_index[idx] = _verify_completed_pair(
+                saved, scenario_pairs_by_index[idx], solver_params,
+            )
+        except (KeyError, ValueError, FloatingPointError, SUEConvergenceError) as exc:
+            print(f"[Recompute checkpoint] sample {idx}: {exc}", flush=True)
+    # Previously failed new solves must be eligible for the stronger/current
+    # solver. Only failures established in this run are terminal.
+    failed_indices = set()
+    failure_records = list(old_failures)
     failed_indices.update(invalid_old_indices)
     failed_indices.update(int(record["index"]) for record in mutation_failures)
     recorded_failure_indices = {
@@ -435,19 +512,6 @@ def main() -> None:
     print(f"checkpoint failed    : {len(failed_indices)}")
     print(f"missing to solve     : {len(missing_indices)}")
 
-    solver_params = {
-        "max_iter": args.max_iter,
-        "convergence_threshold": args.convergence_threshold,
-        "theta": args.theta,
-        "value_iter": args.value_iter,
-        "value_tol": args.value_tol,
-        "flow_iter": args.flow_iter,
-        "flow_tol": args.flow_tol,
-        "retry_flow_iter": args.retry_flow_iter,
-        "retry_max_iter": args.retry_max_iter,
-        "retry_value_iter": args.retry_value_iter,
-        "loading_protocol": args.sue_loading_protocol,
-    }
     solve_missing_with_timeouts(
         scenario_pairs_by_index=scenario_pairs_by_index,
         missing_indices=missing_indices,

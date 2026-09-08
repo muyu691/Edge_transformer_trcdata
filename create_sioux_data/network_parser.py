@@ -139,6 +139,8 @@ def parse_tntp_network(network_file: str, node_id_offset: int = 1) -> tuple[nx.D
             speed=speed,
         )
 
+    # Graph copies used by generation/solving must retain TNTP routing semantics.
+    graph.graph["first_thru_node"] = int(metadata.get("first_thru_node", "1") or 1)
     return graph, metadata
 
 

@@ -25,8 +25,14 @@ def compute_free_flow_times(G, speeds):
     num_edges = len(edges)
     
     free_flow_times = np.zeros((num_samples, num_edges))
+    first_thru = int(G.graph.get("first_thru_node", 1))
     
     for i, (u, v) in enumerate(edges):
+        if first_thru > 1 and (u < first_thru or v < first_thru):
+            if np.any(speeds[:, i] != G[u][v]['speed']):
+                raise ValueError("Cached zone connector speeds changed; regenerate scenarios in a new directory.")
+            free_flow_times[:, i] = G[u][v]['free_flow_time']
+            continue
         length = G[u][v]['length']
         free_flow_times[:, i] = (length / speeds[:, i]) * 60
     
