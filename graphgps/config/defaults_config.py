@@ -37,6 +37,7 @@ def extended_cfg(cfg):
 
     cfg.train.current_epoch = 0
     cfg.train.log_variance_stats = False
+    cfg.train.eval_test_during_training = False
 
     cfg.optim.wsd_stable_epochs = 0
     cfg.optim.wsd_decay_epochs = 50

@@ -916,6 +916,50 @@ def markov_logit_sue_solver(
     return (flows, diagnostics) if return_diagnostics else flows
 
 
+def compute_sue_fixed_point_gap(G, od_matrix, capacities, free_flow_times, flows, *,
+                                node_ids, centroid_nodes, model_parameters):
+    """Evaluate arbitrary nonnegative flows with ONE inner loading, no outer solve.
+
+    All equilibrium parameters come from the dataset certificate. Inner iteration
+    budgets only control numerical loading accuracy; failed loading is an error.
+    Arrays must follow list(G.edges()), as for the label solver.
+    """
+    p = model_parameters
+    if p["solver_version"] != SOLVER_VERSION:
+        raise ValueError("SUEGap solver version differs from the label certificate.")
+    if p["loading_protocol"] not in ("reasonable_links", "stable_reasonable_links") or p["reasonable_link_basis"] != "free_flow_time":
+        raise ValueError("E1 requires the fixed-free-flow reasonable-link label definition.")
+    if int(G.graph.get("first_thru_node", 1)) != int(p["first_thru_node"]):
+        raise ValueError("SUEGap FIRST THRU NODE differs from the label certificate.")
+    if not np.isfinite(p["theta"]) or p["theta"] <= 0:
+        raise ValueError("Invalid label theta.")
+    for key in ("value_tol", "flow_tol"):
+        if not np.isfinite(p[key]) or p[key] <= 0:
+            raise ValueError(f"Invalid label {key}.")
+    edges, od, cap, t0, tails, heads, destinations = _prepare_solver_inputs(
+        G, od_matrix, capacities, free_flow_times, node_ids, centroid_nodes)
+    f = np.asarray(flows, dtype=np.float64).reshape(-1)
+    if f.shape != cap.shape:
+        raise ValueError("Prediction shape does not match the graph.")
+    times = bpr_travel_time(f, cap, t0, alpha=p["bpr_alpha"], beta=p["bpr_beta"])
+    out_mat, in_mat = _build_sparse_edge_incidence(len(node_ids), tails, heads)
+    allowed = _allowed_link_mask(G, node_ids, destinations)
+    if not np.all(allowed):
+        allowed = _compute_reasonable_link_mask(t0, tails, heads, len(node_ids), destinations,
+                                                allowed_mask=allowed, od_matrix=od, downhill=False)
+    fixed = _compute_reasonable_link_mask(t0, tails, heads, len(node_ids), destinations,
+                                          allowed_mask=allowed, od_matrix=od)
+    loaded, converged, diagnostics = _markov_logit_network_loading(
+        times, od, tails, heads, out_mat, in_mat, theta=p["theta"],
+        value_iter=max(500, len(node_ids) + 1), value_tol=p["value_tol"],
+        flow_iter=max(2000, len(node_ids) + 1), flow_tol=p["flow_tol"],
+        loading_protocol=p["loading_protocol"], centroid_indices=destinations,
+        fixed_reasonable_mask=fixed, allowed_mask=allowed, return_diagnostics=True)
+    if not converged:
+        raise SUEConvergenceError("SUEGap inner loading failed.", stage="metric_loading", diagnostics=diagnostics)
+    return float(np.linalg.norm(loaded - f) / (np.linalg.norm(f) + EPS))
+
+
 def verify_sue_solution(G, od_matrix, capacities, free_flow_times, flows, **params):
     """Revalidate an existing label under current equations; never update it."""
     _, diagnostics = markov_logit_sue_solver(

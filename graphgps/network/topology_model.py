@@ -567,6 +567,29 @@ def _safe_std(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.std(unbiased=False)
 
 
+def od_net_demand(batch):
+    """OD columns minus rows, scattered through explicit local centroid mapping."""
+    q = batch.od_matrix
+    positions = batch.ptr[:-1, None] + batch.centroid_pos
+    demand = q.new_zeros(int(batch.num_nodes))
+    demand[positions.reshape(-1)] = (q.sum(dim=1) - q.sum(dim=2)).reshape(-1)
+    return demand
+
+
+class ODNodeEncoder(nn.Module):
+    def __init__(self, centroids, hidden_dim):
+        super().__init__()
+        if centroids <= 0 or hidden_dim % 2:
+            raise ValueError("OD encoder needs a positive centroid count and even hidden dimension.")
+        self.outgoing = nn.Linear(centroids, hidden_dim // 2)
+        self.incoming = nn.Linear(centroids, hidden_dim // 2)
+        self.fuse = nn.Linear(hidden_dim, hidden_dim)
+
+    def forward(self, q):
+        return self.fuse(torch.cat((torch.nn.functional.silu(self.outgoing(q)),
+                                    torch.nn.functional.silu(self.incoming(q.transpose(1, 2)))), dim=-1))
+
+
 @register_network("topology_gnn")
 class NetworkPairsTopologyModel(nn.Module):
     """ST-PINN diffusion-only model."""
@@ -585,6 +608,9 @@ class NetworkPairsTopologyModel(nn.Module):
         )
 
         hidden_dim = int(cfg.topology_gnn.hidden_dim)
+        self.information_mode = str(getattr(cfg.topology_gnn, "information_mode", "old_state"))
+        if self.information_mode not in ("old_state", "od_only", "hybrid"):
+            raise ValueError("information_mode must be old_state, od_only, or hybrid.")
         dropout = float(cfg.topology_gnn.dropout)
         residual = bool(cfg.topology_gnn.residual)
         num_heads = int(cfg.topology_gnn.num_heads)
@@ -716,10 +742,20 @@ class NetworkPairsTopologyModel(nn.Module):
                 residual_scale=self.init_residual_scale,
                 delta_scale=self.init_delta_scale,
             )
+        # Construct after the backbone: matching seeds keep backbone initialization identical.
+        if self.information_mode != "old_state":
+            self.od_encoder = ODNodeEncoder(int(cfg.dataset.centroid_count), hidden_dim)
+            self.register_buffer("od_scale", torch.tensor(float(cfg.dataset.od_scale)))
+        self.initial_flow_mode = "zeros" if self.information_mode == "od_only" else "old_flow_warm_start"
+
+    def _resolve_active_net_demand(self, batch):
+        if self.information_mode == "old_state":
+            return batch.net_demand
+        return od_net_demand(batch)
 
     def _project_initial_flow(self, batch) -> torch.Tensor:
-        device = batch.flow_old.device
-        dtype = batch.flow_old.dtype
+        device = batch.edge_attr_new.device
+        dtype = batch.edge_attr_new.dtype
         num_new_edges = batch.edge_index_new.shape[1]
 
         scaled_zero = (-self.flow_mean / self.flow_std).item()
@@ -753,7 +789,7 @@ class NetworkPairsTopologyModel(nn.Module):
         inflow.scatter_add_(0, dst, f_real_flat)
         outflow.scatter_add_(0, src, f_real_flat)
 
-        net_demand = batch.net_demand.to(device=device, dtype=dtype)
+        net_demand = batch.active_net_demand.to(device=device, dtype=dtype)
         return (inflow - outflow - net_demand).unsqueeze(-1)
 
     def _compute_initial_pressure(self, f_scaled_0: torch.Tensor, batch) -> torch.Tensor:
@@ -771,21 +807,30 @@ class NetworkPairsTopologyModel(nn.Module):
         device = batch.edge_attr_new.device
         dtype = batch.edge_attr_new.dtype
 
+        batch.active_net_demand = self._resolve_active_net_demand(batch)
         f_scaled_0 = self._project_initial_flow(batch)
         rho_v_0 = self._compute_initial_pressure(f_scaled_0, batch)
         batch.f_init_scaled = f_scaled_0
         batch.f_init_real = f_scaled_0 * self.flow_std + self.flow_mean
 
-        aligned_features = self.aligner(
-            edge_index_old=batch.edge_index_old,
-            edge_attr_old=batch.edge_attr_old,
-            flow_old=batch.flow_old,
-            edge_index_new=batch.edge_index_new,
-            edge_attr_new=batch.edge_attr_new,
-            total_nodes=total_nodes,
-        )
+        if self.information_mode == "od_only":
+            aligned_features = torch.cat((batch.edge_attr_new.new_zeros((batch.edge_attr_new.shape[0], 4)),
+                                           batch.edge_attr_new,
+                                           batch.edge_attr_new.new_zeros((batch.edge_attr_new.shape[0], 1))), dim=-1)
+        else:
+            aligned_features = self.aligner(
+                edge_index_old=batch.edge_index_old,
+                edge_attr_old=batch.edge_attr_old,
+                flow_old=batch.flow_old,
+                edge_index_new=batch.edge_index_new,
+                edge_attr_new=batch.edge_attr_new,
+                total_nodes=total_nodes,
+            )
         h_e = self.edge_init_proj(aligned_features)
         h_v = torch.ones(total_nodes, self.hidden_dim, device=device, dtype=dtype)
+        if self.information_mode != "old_state":
+            positions = batch.ptr[:-1, None] + batch.centroid_pos
+            h_v[positions.reshape(-1)] += self.od_encoder(torch.log1p(batch.od_matrix / self.od_scale)).reshape(-1, self.hidden_dim)
 
         f_scaled_k = f_scaled_0
         rho_v_k = rho_v_0
@@ -850,4 +895,4 @@ class NetworkPairsTopologyModel(nn.Module):
             batch.rho_v_std = _safe_std(rho_v_k)
             batch.rho_v_abs_mean = rho_v_k.detach().float().abs().mean()
 
-        return f_scaled_k, batch.y
+        return f_scaled_k, getattr(batch, "y", None)

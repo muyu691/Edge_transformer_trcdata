@@ -7,6 +7,7 @@ from yacs.config import CfgNode as CN
 @register_config("topology_gnn")
 def topology_gnn_cfg(cfg):
     cfg.topology_gnn = CN()
+    cfg.topology_gnn.information_mode = "old_state"
 
     cfg.topology_gnn.hidden_dim = 128
     cfg.topology_gnn.dropout = 0.1

@@ -9,7 +9,6 @@ from torch_geometric.graphgym.checkpoint import clean_ckpt, load_ckpt, save_ckpt
 from torch_geometric.graphgym.config import cfg
 from torch_geometric.graphgym.register import register_train
 from torch_geometric.graphgym.utils.epoch import is_ckpt_epoch, is_eval_epoch
-from torchmetrics.functional import mean_absolute_error
 
 from constraint_violation.metrics import ConstraintViolationAccumulator
 from graphgps.loss.flow_conservation_loss import compute_pinn_loss
@@ -274,150 +273,6 @@ def _unpack_model_output(output):
     return output
 
 
-@torch.no_grad()
-def detailed_test_evaluation(loader, model, split="test"):
-    model.eval()
-    device = torch.device(cfg.accelerator)
-
-    per_graph_wmapes = []
-    all_preds_new = []
-    all_trues_new = []
-    all_preds_old = []
-    all_trues_old = []
-    total_time_ms = 0.0
-    total_graphs = 0
-    use_cuda = device.type == "cuda"
-
-    for batch in loader:
-        batch.to(device)
-        total_graphs += batch.num_graphs
-
-        if use_cuda:
-            start_evt = torch.cuda.Event(enable_timing=True)
-            end_evt = torch.cuda.Event(enable_timing=True)
-            start_evt.record()
-            output = model(batch)
-            end_evt.record()
-            torch.cuda.synchronize()
-            batch_time_ms = start_evt.elapsed_time(end_evt)
-        else:
-            t0 = time.perf_counter()
-            output = model(batch)
-            batch_time_ms = (time.perf_counter() - t0) * 1000.0
-
-        pred, true = _unpack_model_output(output)
-        total_time_ms += batch_time_ms
-
-        pred_real, true_real, _ = get_flow_metric_tensors(
-            pred.detach().cpu().float(),
-            true.detach().cpu().float(),
-        )
-
-        edge_batch = batch.batch[batch.edge_index_new[0]].detach().cpu()
-        for graph_idx in range(batch.num_graphs):
-            mask_graph = edge_batch == graph_idx
-            pred_graph = pred_real[mask_graph]
-            true_graph = true_real[mask_graph]
-            if true_graph.numel() > 0:
-                per_graph_wmapes.append(wmape(pred_graph, true_graph).item())
-
-        if hasattr(batch, "new_edge_mask"):
-            is_new_edge = batch.new_edge_mask.bool().detach().cpu()
-        else:
-            is_new_edge = _compute_new_edge_mask(batch).detach().cpu()
-
-        if is_new_edge.any():
-            all_preds_new.append(pred_real[is_new_edge])
-            all_trues_new.append(true_real[is_new_edge])
-        if (~is_new_edge).any():
-            all_preds_old.append(pred_real[~is_new_edge])
-            all_trues_old.append(true_real[~is_new_edge])
-
-    q_values = None
-    w_tensor = None
-    if per_graph_wmapes:
-        w_tensor = torch.tensor(per_graph_wmapes, dtype=torch.float64)
-        q_values = torch.quantile(w_tensor, torch.tensor([0.25, 0.50, 0.75, 0.95], dtype=torch.float64))
-        logging.info(
-            "\n%s\n  [%s] Per-Graph WMAPE Distribution (%s graphs, %s)\n%s\n"
-            "    Mean   WMAPE : %.6f\n"
-            "    Std    WMAPE : %.6f\n"
-            "    Min    WMAPE : %.6f\n"
-            "    25%% percentile : %.6f\n"
-            "    50%% percentile : %.6f\n"
-            "    75%% percentile : %.6f\n"
-            "    95%% percentile : %.6f\n"
-            "    Max    WMAPE : %.6f\n%s",
-            "=" * 70,
-            split.upper(),
-            len(per_graph_wmapes),
-            flow_metric_space_tag(),
-            "=" * 70,
-            w_tensor.mean(),
-            w_tensor.std(),
-            w_tensor.min(),
-            q_values[0],
-            q_values[1],
-            q_values[2],
-            q_values[3],
-            w_tensor.max(),
-            "=" * 70,
-        )
-
-    def _edge_metrics(pred_list, true_list, label):
-        if not pred_list:
-            logging.info("    %s: No edges found in %s split.", label, split)
-            return
-        pred_tensor = torch.cat(pred_list)
-        true_tensor = torch.cat(true_list)
-        logging.info(
-            "    %s: count=%7d  WMAPE=%.6f  MAE=%.4f",
-            label,
-            pred_tensor.shape[0],
-            wmape(pred_tensor, true_tensor).item(),
-            mean_absolute_error(pred_tensor.view(-1), true_tensor.view(-1)).item(),
-        )
-
-    logging.info(
-        "\n%s\n  [%s] New-Edge vs Old-Edge Metrics (%s)\n%s",
-        "=" * 70,
-        split.upper(),
-        flow_metric_space_tag(),
-        "=" * 70,
-    )
-    _edge_metrics(all_preds_old, all_trues_old, "Old edges (retained)")
-    _edge_metrics(all_preds_new, all_trues_new, "New edges (added)")
-    _edge_metrics(all_preds_old + all_preds_new, all_trues_old + all_trues_new, "All edges (combined)")
-    logging.info("%s", "=" * 70)
-
-    avg_time_per_graph = total_time_ms / max(total_graphs, 1)
-    logging.info(
-        "\n%s\n  [%s] Inference Timing\n%s\n"
-        "    Device               : %s\n"
-        "    Total graphs         : %s\n"
-        "    Total inference time : %.2f ms\n"
-        "    Avg time per graph   : %.4f ms\n%s",
-        "=" * 70,
-        split.upper(),
-        "=" * 70,
-        device,
-        total_graphs,
-        total_time_ms,
-        avg_time_per_graph,
-        "=" * 70,
-    )
-
-    return {
-        "wmape_percentiles": {
-            "p25": float(q_values[0]) if q_values is not None else None,
-            "p50": float(q_values[1]) if q_values is not None else None,
-            "p75": float(q_values[2]) if q_values is not None else None,
-            "p95": float(q_values[3]) if q_values is not None else None,
-        },
-        "wmape_mean": float(w_tensor.mean()) if w_tensor is not None else None,
-        "avg_time_per_graph_ms": avg_time_per_graph,
-        "total_graphs": total_graphs,
-    }
 
 
 @torch.no_grad()
@@ -592,11 +447,6 @@ def _finalize_summary(loaders, model, perf, best_epoch, best_metric_value, full_
         return
 
     logging.info("\n%s", "=" * 70)
-    logging.info("  Running detailed test evaluation ...")
-    logging.info("%s", "=" * 70)
-    detailed_test_evaluation(loaders[2], model, split="test")
-
-    logging.info("\n%s", "=" * 70)
     logging.info("  Running baseline-aligned test evaluation ...")
     logging.info("%s", "=" * 70)
     final_summary = evaluate_baseline_aligned_split(loaders[2], model, split="test")
@@ -628,7 +478,8 @@ def _finalize_summary(loaders, model, perf, best_epoch, best_metric_value, full_
     }
     if perf is not None:
         summary_payload["validation_at_best_epoch"] = perf[1][best_epoch]
-        summary_payload["test_logger_at_best_epoch"] = perf[2][best_epoch]
+        if perf[2]:
+            summary_payload["test_logger_at_best_epoch"] = perf[2][best_epoch]
     if inference_wall_clock_seconds is not None:
         summary_payload["inference_wall_clock_seconds"] = float(inference_wall_clock_seconds)
 
@@ -639,6 +490,10 @@ def _finalize_summary(loaders, model, perf, best_epoch, best_metric_value, full_
 
 @register_train("custom")
 def custom_train(loggers, loaders, model, optimizer, scheduler):
+    eval_test = bool(getattr(cfg.train, "eval_test_during_training", False))
+    if not eval_test:
+        cfg.train.enable_ckpt = True
+        cfg.train.ckpt_best = True
     start_epoch = 0
     if cfg.train.auto_resume:
         start_epoch = load_ckpt(model, optimizer, scheduler, cfg.train.epoch_resume)
@@ -657,10 +512,10 @@ def custom_train(loggers, loaders, model, optimizer, scheduler):
         run = wandb.init(entity=cfg.wandb.entity, project=cfg.wandb.project, name=wandb_name)
         run.config.update(cfg_to_dict(cfg))
 
-    num_splits = len(loggers)
+    num_splits = len(loggers) if eval_test else 2
     split_names = ["val", "test"]
     full_epoch_times = []
-    perf = [[] for _ in range(num_splits)]
+    perf = [[] for _ in loggers]
 
     for cur_epoch in range(start_epoch, cfg.optim.max_epoch):
         start_time = time.perf_counter()
@@ -689,7 +544,7 @@ def custom_train(loggers, loaders, model, optimizer, scheduler):
             save_ckpt(model, optimizer, scheduler, cur_epoch)
 
         if run is not None:
-            run.log(flatten_dict(perf), step=cur_epoch)
+            run.log(flatten_dict(perf[:num_splits]), step=cur_epoch)
 
         if is_eval_epoch(cur_epoch):
             best_epoch, _ = _select_best_epoch(val_perf)
@@ -701,14 +556,13 @@ def custom_train(loggers, loaders, model, optimizer, scheduler):
 
             logging.info(
                 "> Epoch %s: took %.1fs (avg %.1fs) | Best so far: epoch %s\t"
-                "train_loss: %.4f\tval_loss: %.4f\ttest_loss: %.4f\tval_%s: %.4f",
+                "train_loss: %.4f\tval_loss: %.4f\tval_%s: %.4f",
                 cur_epoch,
                 full_epoch_times[-1],
                 np.mean(full_epoch_times),
                 best_epoch,
                 perf[0][best_epoch]["loss"],
                 perf[1][best_epoch]["loss"],
-                perf[2][best_epoch]["loss"],
                 best_metric,
                 perf[1][best_epoch][best_metric],
             )
@@ -719,7 +573,6 @@ def custom_train(loggers, loaders, model, optimizer, scheduler):
                         "best/epoch": best_epoch,
                         "best/train_loss": perf[0][best_epoch]["loss"],
                         "best/val_loss": perf[1][best_epoch]["loss"],
-                        "best/test_loss": perf[2][best_epoch]["loss"],
                     },
                     step=cur_epoch,
                 )
@@ -731,15 +584,10 @@ def custom_train(loggers, loaders, model, optimizer, scheduler):
 
     best_epoch_final, best_metric_value = _select_best_epoch(perf[1])
     if cfg.train.enable_ckpt and cfg.train.ckpt_best:
-        try:
-            load_ckpt(model, optimizer, scheduler, best_epoch_final)
-            logging.info("Loaded best checkpoint from epoch %s for final evaluation.", best_epoch_final)
-        except Exception as exc:
-            logging.warning(
-                "Failed to reload best checkpoint at epoch %s; using in-memory model. Error: %s",
-                best_epoch_final,
-                exc,
-            )
+        loaded_epoch = load_ckpt(model, optimizer, scheduler, best_epoch_final)
+        if loaded_epoch != best_epoch_final + 1:
+            raise RuntimeError("Best-validation checkpoint could not be reloaded; refusing final test.")
+        logging.info("Loaded best checkpoint from epoch %s for final evaluation.", best_epoch_final)
 
     _save_training_history(perf, full_epoch_times)
     _finalize_summary(loaders, model, perf, best_epoch_final, best_metric_value, full_epoch_times)

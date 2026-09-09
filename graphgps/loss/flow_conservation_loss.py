@@ -152,7 +152,10 @@ def _compute_terminal_balance_residual(pred_scaled: torch.Tensor, batch) -> torc
     inflow.scatter_add_(0, dst, f_real_flat)
     outflow.scatter_add_(0, src, f_real_flat)
 
-    net_demand = batch.net_demand.to(device=pred_scaled.device, dtype=pred_scaled.dtype).view(-1)
+    net_demand = getattr(batch, "active_net_demand", None)
+    if net_demand is None:
+        net_demand = batch.net_demand
+    net_demand = net_demand.to(device=pred_scaled.device, dtype=pred_scaled.dtype).view(-1)
     return inflow - outflow - net_demand
 
 

@@ -27,6 +27,7 @@ def dataset_cfg(cfg):
 
     cfg.dataset.flow_mean = 0.0
     cfg.dataset.flow_std = 1.0
+    cfg.dataset.od_scale = 1.0
 
     cfg.dataset.mask_capacity = False
     cfg.dataset.mask_fft = False

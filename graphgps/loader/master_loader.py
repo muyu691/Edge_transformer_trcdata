@@ -123,6 +123,7 @@ def preformat_network_pairs(dataset_dir: str):
     cfg.dataset.num_edges_new = int(metadata["num_edges_new"])
     cfg.dataset.od_dim = int(metadata["od_dim"])
     cfg.dataset.centroid_count = int(metadata["centroid_count"])
+    cfg.dataset.od_scale = float(metadata.get("od_scale", 1.0))
 
     flow_scaler_path = osp.join(actual_dir, metadata["files"]["flow_scaler"])
     with open(flow_scaler_path, "rb") as handle:
@@ -161,14 +162,20 @@ def join_dataset_splits(datasets):
 
     n1, n2, n3 = len(datasets[0]), len(datasets[1]), len(datasets[2])
     data_list = (
-        [datasets[0].get(i) for i in range(n1)]
-        + [datasets[1].get(i) for i in range(n2)]
-        + [datasets[2].get(i) for i in range(n3)]
+        [datasets[0].get_graph(i) for i in range(n1)]
+        + [datasets[1].get_graph(i) for i in range(n2)]
+        + [datasets[2].get_graph(i) for i in range(n3)]
     )
 
     datasets[0]._indices = None
     datasets[0]._data_list = data_list
     datasets[0].data, datasets[0].slices = datasets[0].collate(data_list)
+    segments = []
+    for dataset, offset in zip(datasets, (0, n1, n1 + n2)):
+        segments.extend((start + offset, end + offset, path)
+                        for start, end, path in dataset._od_segments)
+    datasets[0]._od_segments = segments
+    datasets[0]._od_maps = {}
     datasets[0].split_idxs = [
         list(range(n1)),
         list(range(n1, n1 + n2)),
